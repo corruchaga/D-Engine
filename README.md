@@ -1,31 +1,53 @@
 # D-Engine
 
-La IA piensa, la puerta decide
+**The AI thinks, the gate decides.**
 
-## Que es
+A deterministic harness for LLM code edits. The model proposes `SEARCH/REPLACE` blocks; a local runtime applies them in a shadow git worktree, checks the result with `tsc --noEmit`, and merges only if compilation passes. The LLM never writes to your real branch.
 
-CLI determinista de edicion de codigo con LLM. El modelo propone bloques SEARCH/REPLACE; un runtime local los aplica en un git worktree en sombra, comprueba con `tsc --noEmit` y solo fusiona si compila.
+📄 **Read the full story:** [The AI thinks, the gate decides — how I made LLM code edits deterministic (42× fewer tokens)](https://dev.to/sergiocorruchaga/the-ai-thinks-the-gate-decides-how-i-made-llm-code-edits-deterministic-and-cut-token-usage-42x-5cbi)
+🇪🇸 [README en español](README.es.md)
 
-Principio: **la IA propone, la puerta determinista decide.** El LLM no escribe en la rama real.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## Benchmark (portada)
+## Why
 
-Misma tarea, mismo modelo V4.1-Flash, mismo prompt literal:
+Agentic coding loops pay their token bill twice: every turn re-sends the whole trajectory (files, tool results, reasoning) to the model, and "thinking" modes multiply both the tokens per turn and the number of turns. D-Engine removes the loop for the bounded-edit case: one prompt, one patch set, one deterministic gate.
 
-| Runtime | Tokens | Tiempo |
+Same task, same model (V4.1-Flash), same literal prompt:
+
+| Runtime | Tokens | Time |
 | --- | --- | --- |
-| D-Engine v0.2.2 | 2.552 | ~4s |
-| dsh Minimal | 34.600 | 1m04s |
-| dsh esfuerzo Apagado | 37.100 | 6s |
-| dsh fabrica (thinking Alto) | 107.000 | 28s |
+| D-Engine v0.2.2 | 2,552 | ~4 s |
+| dsh Minimal (single shell tool) | 34,600 | 1m04s |
+| dsh, effort off | 37,100 | 6 s |
+| dsh factory defaults (thinking High) | 107,000 | 28 s |
 
-Resultados globales: calidad **48/50** (empate con el mejor agente del benchmark), media **~2.100 tokens/tarea** vs **~93.000** de dsh, tiempo medio **~2,7s** vs **~38s**.
+The toolbox is not the cost — **the agentic loop is**.
 
-Benchmark completo y reproducible: [docs/benchmark.md](docs/benchmark.md)
+## How it works
 
-## Instalacion y uso
+1. You describe the change; an automatic selector (P9) picks the target files by token budget.
+2. The LLM returns `SEARCH/REPLACE` blocks — nothing else.
+3. A 4-strategy cascade applies them locally: exact → normalized newlines → ignore trailing whitespace → fuzzy (0.85 threshold).
+4. Everything happens in a shadow git worktree. `tsc --noEmit` is the only source of truth.
+5. Green compile → merge. Anything else → nothing touches your branch.
 
-Requisitos: Node.js, git, TypeScript en el repo objetivo (`tsc --noEmit`).
+## Benchmark (headline)
+
+10 frozen tasks, same model family, one attempt each, full methodology disclosed:
+
+| Metric | D-Engine | Agentic loop (dsh, factory) |
+| --- | --- | --- |
+| Quality (max 50) | 48 | 48 |
+| Avg tokens per task | ~2,100 (bounded) | ~93,000 (range 32K–214K) |
+| Avg time per task | ~2.7 s | ~38 s |
+| Broken commits on main | 0 | 1 (Aider, trap task) |
+
+Tied quality, **14–42× fewer tokens**, a predictable bill, zero broken merges. The full benchmark — frozen prompts, voided rows, hallucination incident and all — ships in [docs/benchmark.md](docs/benchmark.md) (Spanish, translation in progress).
+
+## Install & usage
+
+Requirements: Node.js, git, TypeScript in the target repo (`tsc --noEmit`).
 
 ```bash
 git clone https://github.com/corruchaga/D-Engine
@@ -34,40 +56,40 @@ npm install
 cp .env.example .env
 ```
 
-Rellena `LLM_BASE_URL`, `LLM_API_KEY` y `LLM_MODEL` en `.env`.
+Fill in `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` in `.env`.
 
-Desarrollo (sin build):
+Development (no build):
 
 ```bash
 npm run dev
 ```
 
-Produccion local:
+Local production:
 
 ```bash
 npm run build
 npm start
 ```
 
-La TUI pide: descripcion del cambio, archivo objetivo (Enter vacio = selector automatico), modo de seguridad (Fast / Verify / Shadow) y confirmacion. Fast consolida tras aplicar; Verify anade auditoria semantica; Shadow no consolida sin permiso.
+The TUI asks for: change description, target file (empty Enter = automatic selector), safety mode (Fast / Verify / Shadow) and confirmation. Fast merges after applying; Verify adds a semantic audit; Shadow never merges without permission.
 
-`npm run typecheck` equivale a `tsc --noEmit`.
+`npm run typecheck` is equivalent to `tsc --noEmit`.
 
-## Limitaciones conocidas
+## Known limitations
 
-- No crea archivos nuevos.
-- El matching fuzzy (umbral 0,85) es el eslabon debil.
-- El selector de archivos P9 no es determinista.
+- Cannot create new files (yet — see roadmap).
+- Fuzzy matching (0.85 threshold) is the weak link.
+- The P9 file selector is not deterministic.
 
 ## Roadmap v0.3
 
-- Creacion de archivos nuevos
-- Reintento con feedback de tsc
-- Verify obligatorio si el parche aplica via fuzzy
-- Tiempo y tokens en el resumen final
+- New-file creation
+- Retry loop with compiler feedback
+- Mandatory Verify when a patch applied via fuzzy
+- Time and tokens in the final summary
 
-📄 Article: [The AI thinks, the gate decides — how I made LLM code edits deterministic (42× fewer tokens)](https://dev.to/sergiocorruchaga/the-ai-thinks-the-gate-decides-how-i-made-llm-code-edits-deterministic-and-cut-token-usage-42x-5cbi)
-
-## Licencia
+## License
 
 MIT. Copyright (c) 2026 Sergi Corruchaga.
+
+📄 Article: [The AI thinks, the gate decides — how I made LLM code edits deterministic (42× fewer tokens)](https://dev.to/sergiocorruchaga/the-ai-thinks-the-gate-decides-how-i-made-llm-code-edits-deterministic-and-cut-token-usage-42x-5cbi)
