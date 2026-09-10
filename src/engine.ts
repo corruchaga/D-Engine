@@ -13,6 +13,36 @@ function gitLog(message: string): void {
   console.log(`[d-engine:git] ${message}`);
 }
 
+function normalizeRepoPath(rel: string): string {
+  return rel.replaceAll("\\", "/").replace(/^\.\//, "");
+}
+
+function unquoteGitPath(value: string): string {
+  if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
+    return value
+      .slice(1, -1)
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t")
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\");
+  }
+  return value;
+}
+
+function parsePorcelainPaths(porcelain: string): string[] {
+  const paths: string[] = [];
+  for (const rawLine of porcelain.split(/\r?\n/)) {
+    if (rawLine.length === 0) continue;
+    const rest = rawLine.length >= 3 ? rawLine.slice(3) : rawLine.trim();
+    const parts = rest.includes(" -> ") ? rest.split(" -> ") : [rest];
+    for (const part of parts) {
+      const cleaned = normalizeRepoPath(unquoteGitPath(part.trim()));
+      if (cleaned) paths.push(cleaned);
+    }
+  }
+  return paths;
+}
+
 async function runGit(args: string[], action: string, options: GitOptions = {}): Promise<string> {
   const cwd = options.cwd ?? process.cwd();
   gitLog(`${action}`);
@@ -111,26 +141,64 @@ export class ShadowWorkspace {
     }
   }
 
-  async commitAndMerge(message: string): Promise<boolean> {
+  async restoreFiles(files: string[]): Promise<void> {
+    const photocopy = this.worktreePath;
+    const unique = [...new Set(files.map(normalizeRepoPath).filter(Boolean))];
+    if (!photocopy || unique.length === 0) return;
+    await runGit(["checkout", "HEAD", "--", ...unique], "restaurar archivos al HEAD de la fotocopia", {
+      cwd: photocopy,
+    });
+  }
+
+  async commitAndMerge(message: string, files: string[]): Promise<boolean> {
     const photocopy = this.worktreePath;
     const root = this.repoRoot || process.cwd();
+    const allowed = [...new Set(files.map(normalizeRepoPath).filter(Boolean))];
+    const allowedSet = new Set(allowed);
 
     gitLog(`commitAndMerge: fotocopia=${photocopy}`);
     gitLog(`commitAndMerge: repo principal=${root} rama=${this.originalBranch || "(desconocida)"}`);
+    gitLog(`commitAndMerge: archivos del parche=${allowed.join(", ") || "(ninguno)"}`);
 
     const porcelain = await runGit(["status", "--porcelain", "-uall"], "status en la FOTOCOPIA (no en master)", {
       cwd: photocopy,
     });
     gitLog(`guard porcelain (fotocopia):\n${porcelain.trim() || "(vacio)"}`);
 
-    await runGit(["add", "-A"], "git add -A en la FOTOCOPIA", { cwd: photocopy });
+    const dirty = parsePorcelainPaths(porcelain);
+    const extra = [...new Set(dirty.filter((rel) => !allowedSet.has(rel)))];
+    if (extra.length > 0) {
+      throw new Error(
+        `La fotocopia tiene cambios fuera de los archivos del parche: ${extra.join(", ")}`
+      );
+    }
+
+    if (allowed.length === 0) {
+      gitLog("sin cambios que consolidar: no hay archivos del parche");
+      return false;
+    }
+
+    await runGit(["add", "--", ...allowed], "git add -- archivos del parche en la FOTOCOPIA", {
+      cwd: photocopy,
+    });
 
     const staged = await runGit(["diff", "--cached", "--name-only"], "archivos staged en la FOTOCOPIA", {
       cwd: photocopy,
     });
     gitLog(`guard staged (fotocopia):\n${staged.trim() || "(vacio)"}`);
 
-    if (staged.trim().length === 0) {
+    const stagedFiles = staged
+      .split(/\r?\n/)
+      .map((line) => normalizeRepoPath(line.trim()))
+      .filter(Boolean);
+    const stagedExtra = stagedFiles.filter((rel) => !allowedSet.has(rel));
+    if (stagedExtra.length > 0) {
+      throw new Error(
+        `La fotocopia tiene staged fuera de los archivos del parche: ${stagedExtra.join(", ")}`
+      );
+    }
+
+    if (stagedFiles.length === 0) {
       gitLog("sin cambios que consolidar: la fotocopia no tiene diff staged");
       return false;
     }

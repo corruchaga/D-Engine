@@ -1,6 +1,6 @@
 {
   "name": "d-engine",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "CLI determinista de edicion de codigo con IA: la IA propone, el motor decide.",
   "type": "module",
   "main": "dist/index.js",

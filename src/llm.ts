@@ -147,20 +147,25 @@ export async function verifyChanges(prompt: string, diff: string): Promise<Propo
   ]);
 }
 
+function stripVerdictRest(trimmed: string, prefix: string): string {
+  return trimmed.slice(prefix.length).replace(/^[\s:.\-—–]+/, "").trim();
+}
+
 export function parseVerifyVerdict(text: string): { ok: boolean; reason: string } {
-  const line = text.trim().split(/\r?\n/)[0]?.trim() ?? "";
-  const fallo = /^FALLO:\s*(.*)$/i.exec(line);
-  if (fallo) {
-    return { ok: false, reason: (fallo[1] ?? "").trim() || "auditoria rechazada" };
+  const trimmed = text.trim();
+  const head = trimmed.toUpperCase();
+  if (head.startsWith("FALLO")) {
+    const reason = stripVerdictRest(trimmed, "FALLO");
+    return { ok: false, reason: reason || "auditoria rechazada" };
   }
-  const notes = /^OK_CON_OBSERVACIONES:\s*(.*)$/i.exec(line);
-  if (notes) {
-    return { ok: true, reason: (notes[1] ?? "").trim() };
+  if (head.startsWith("OK_CON_OBSERVACIONES")) {
+    return { ok: true, reason: stripVerdictRest(trimmed, "OK_CON_OBSERVACIONES") };
   }
-  if (/^OK\s*$/i.test(line)) {
+  if (head.startsWith("OK")) {
     return { ok: true, reason: "" };
   }
-  return { ok: false, reason: line || "auditoria rechazada" };
+  console.log(`[d-engine] veredicto de auditoria con formato desconocido. Respuesta cruda:\n${text}`);
+  return { ok: false, reason: trimmed || "auditoria rechazada" };
 }
 
 export async function proposeCorrection(

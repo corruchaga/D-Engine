@@ -117,8 +117,8 @@ function unauthorizedBlockPaths(blocks: EditBlock[], targets: string[]): string[
   return [...new Set(blocks.map((block) => block.filePath).filter((rel) => !allowed.has(rel)))];
 }
 
-async function mergeChanges(ws: ShadowWorkspace, message: string): Promise<void> {
-  const merged = await ws.commitAndMerge(message);
+async function mergeChanges(ws: ShadowWorkspace, message: string, files: string[]): Promise<void> {
+  const merged = await ws.commitAndMerge(message, files);
   if (merged) {
     log.success(pc.green("Cambios consolidados en la rama real."));
   } else {
@@ -240,15 +240,56 @@ async function main(): Promise<void> {
       }
     }
 
-    const applied = blocks.map((block) => LocalEditor.apply(worktreePath, block));
+    let applied = blocks.map((block) => LocalEditor.apply(worktreePath, block));
     s.stop();
     for (const result of applied) {
       log.success(pc.green(`Parche aplicado en ${result.filePath} (${result.strategy})`));
     }
 
     s.start("Compilando como puerta (tsc --noEmit)...");
-    const check = await Validator.run(worktreePath);
+    let check = await Validator.run(worktreePath);
     s.stop();
+
+    if (!check.ok) {
+      console.log("[d-engine] compilacion fallida, reintentando con feedback (1/1)");
+      log.warn("Compilacion fallida. Reintentando con feedback (1/1)...");
+      if (check.output.length > 0) {
+        log.message(check.output);
+      }
+      await ws.restoreFiles(applied.map((result) => result.filePath));
+      const compileFeedback = [
+        "la compilacion (tsc --noEmit) fallo. Regenera UNICAMENTE bloques SEARCH/REPLACE que corrijan estos errores.",
+        "El archivo objetivo esta en su estado original; no asumas que el intento anterior sigue aplicado.",
+        "Errores de tsc:",
+        check.output || "(sin output)",
+      ].join("\n");
+      s.start("Llamando al LLM para corregir errores de compilacion...");
+      proposal = await proposeCorrection(promptText, targetRels, proposal.text, compileFeedback);
+      try {
+        blocks = withNormalizedPaths(LLMParser.parse(proposal.text));
+      } catch {
+        s.stop();
+        throw new Error(
+          "El LLM no devolvio bloques SEARCH/REPLACE validos al corregir la compilacion."
+        );
+      }
+      missing = unauthorizedBlockPaths(blocks, targetRels);
+      if (missing.length > 0) {
+        s.stop();
+        const stillWrong = missing[0] ?? "(desconocida)";
+        throw new Error(
+          `El archivo del bloque no es un objetivo (apuntaba a ${stillWrong}; los objetivos son ${targetRels.join(", ")}) al corregir la compilacion.`
+        );
+      }
+      applied = blocks.map((block) => LocalEditor.apply(worktreePath, block));
+      s.stop();
+      for (const result of applied) {
+        log.success(pc.green(`Parche aplicado en ${result.filePath} (${result.strategy})`));
+      }
+      s.start("Compilando como puerta (tsc --noEmit)...");
+      check = await Validator.run(worktreePath);
+      s.stop();
+    }
 
     if (!check.ok) {
       log.error(pc.red("La puerta de compilacion rechazo el cambio. Nada se consolida."));
@@ -297,7 +338,9 @@ async function main(): Promise<void> {
         );
 
         if (consolidate) {
-          await mergeChanges(ws, "D-Engine: cambios consolidados en modo shadow");
+          await mergeChanges(ws, "D-Engine: cambios consolidados en modo shadow", [
+            ...new Set(applied.map((result) => result.filePath)),
+          ]);
         } else {
           await destroyShadow(s, ws);
           shadowCreated = false;
@@ -306,7 +349,8 @@ async function main(): Promise<void> {
       } else {
         await mergeChanges(
           ws,
-          mode.runAudit ? "D-Engine: cambios consolidados en modo verify" : "D-Engine: cambios consolidados en modo fast"
+          mode.runAudit ? "D-Engine: cambios consolidados en modo verify" : "D-Engine: cambios consolidados en modo fast",
+          [...new Set(applied.map((result) => result.filePath))]
         );
       }
     }
