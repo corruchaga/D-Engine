@@ -71,7 +71,12 @@ async function chatCompletions(messages: ChatMessage[], options: ChatOptions = {
   const model = env("LLM_MODEL");
   const url = chatUrl(base);
 
-  const payload: { model: string; messages: ChatMessage[]; max_tokens?: number } = { model, messages };
+  const payload: {
+    model: string;
+    messages: ChatMessage[];
+    max_tokens?: number;
+    thinking: { type: "disabled" };
+  } = { model, messages, thinking: { type: "disabled" } };
   if (options.maxTokens !== undefined) payload.max_tokens = options.maxTokens;
 
   let response: Response;
