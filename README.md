@@ -66,6 +66,8 @@ La TUI pide: descripcion del cambio, archivo objetivo (Enter vacio = selector au
 - Verify obligatorio si el parche aplica via fuzzy
 - Tiempo y tokens en el resumen final
 
+📄 Article: [The AI thinks, the gate decides — how I made LLM code edits deterministic (42× fewer tokens)](https://dev.to/sergiocorruchaga/the-ai-thinks-the-gate-decides-how-i-made-llm-code-edits-deterministic-and-cut-token-usage-42x-5cbi)
+
 ## Licencia
 
 MIT. Copyright (c) 2026 Sergi Corruchaga.
