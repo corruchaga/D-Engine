@@ -1,4 +1,6 @@
 import { config } from "dotenv";
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { buildContext } from "./context.js";
 
 config();
@@ -29,7 +31,8 @@ codigo de reemplazo
 Reglas:
 - SEARCH debe copiar el codigo existente con exactitud de caracteres: espacios, indentacion y saltos de linea identicos al archivo.
 - SEARCH debe ser un fragmento unico en el archivo.
-- No inventes rutas. Usa exactamente la ruta indicada.
+- No inventes rutas. Usa exactamente las rutas de archivo objetivo indicadas.
+- Puedes responder con bloques para uno o varios de esos archivos.
 - Si hay varios cambios, emite varios bloques. Nada mas.`;
 
 const CORRECTION =
@@ -99,29 +102,30 @@ async function chatCompletions(messages: ChatMessage[]): Promise<ProposeResult> 
   return { text, tokensIn, tokensOut };
 }
 
-function userMessage(prompt: string, filePath: string, fileContent: string): string {
+function userMessage(prompt: string, filePaths: string[], context: string): string {
+  const listed = filePaths.flatMap((filePath) => [
+    `ARCHIVO: ${filePath}`,
+    ``,
+    readFileSync(path.resolve(process.cwd(), filePath), "utf8"),
+    ``,
+  ]);
   return [
     `Prompt del usuario:`,
     prompt,
     ``,
-    `ARCHIVO: ${filePath}`,
+    ...listed,
+    `Usa exactamente esas rutas en la cabecera de cada bloque. Puedes emitir bloques para uno o varios de esos archivos. No las acortes ni las cambies.`,
     ``,
-    `Usa exactamente esa ruta en la cabecera de cada bloque. No la acortes ni la cambies.`,
-    ``,
-    `Contenido actual:`,
-    fileContent,
+    `Contexto:`,
+    context,
   ].join("\n");
 }
 
-export async function proposeChanges(
-  prompt: string,
-  filePath: string,
-  _fileContent: string
-): Promise<ProposeResult> {
-  const context = await buildContext(filePath);
+export async function proposeChanges(prompt: string, filePaths: string[]): Promise<ProposeResult> {
+  const context = await buildContext(filePaths);
   return chatCompletions([
     { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: userMessage(prompt, filePath, context) },
+    { role: "user", content: userMessage(prompt, filePaths, context) },
   ]);
 }
 
@@ -161,14 +165,14 @@ export function parseVerifyVerdict(text: string): { ok: boolean; reason: string 
 
 export async function proposeCorrection(
   prompt: string,
-  filePath: string,
-  fileContent: string,
+  filePaths: string[],
   previousText: string,
   correction: string = CORRECTION
 ): Promise<ProposeResult> {
+  const context = await buildContext(filePaths);
   return chatCompletions([
     { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: userMessage(prompt, filePath, fileContent) },
+    { role: "user", content: userMessage(prompt, filePaths, context) },
     { role: "assistant", content: previousText },
     { role: "user", content: correction },
   ]);

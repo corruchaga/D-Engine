@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { intro, outro, text, select, confirm, spinner, log, cancel, isCancel } from "@clack/prompts";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
 import path from "node:path";
 import pc from "picocolors";
 import { LLMParser, LocalEditor, ShadowWorkspace, Validator, type EditBlock } from "./engine.js";
@@ -99,10 +99,22 @@ function withNormalizedPaths(blocks: EditBlock[]): EditBlock[] {
   return blocks.map((block) => ({ ...block, filePath: normalizeRel(block.filePath) }));
 }
 
-function missingBlockPaths(worktreePath: string, blocks: EditBlock[]): string[] {
-  return blocks
-    .map((block) => block.filePath)
-    .filter((rel) => !existsSync(path.join(worktreePath, rel)));
+function parseTargets(value: string): string[] {
+  const raw = value.trim() || DEFAULT_TARGET;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const part of raw.split(",")) {
+    const rel = normalizeRel(part.trim());
+    if (!rel || seen.has(rel)) continue;
+    seen.add(rel);
+    out.push(rel);
+  }
+  return out.length > 0 ? out : [DEFAULT_TARGET];
+}
+
+function unauthorizedBlockPaths(blocks: EditBlock[], targets: string[]): string[] {
+  const allowed = new Set(targets);
+  return [...new Set(blocks.map((block) => block.filePath).filter((rel) => !allowed.has(rel)))];
 }
 
 async function mergeChanges(ws: ShadowWorkspace, message: string): Promise<void> {
@@ -135,13 +147,13 @@ async function main(): Promise<void> {
       placeholder: DEFAULT_TARGET,
       defaultValue: DEFAULT_TARGET,
       validate: (value) => {
-        const rel = normalizeRel((value ?? "").trim() || DEFAULT_TARGET);
-        const abs = path.resolve(process.cwd(), rel);
-        if (!existsSync(abs)) return `El archivo no existe en el repo: ${rel}`;
+        const rels = parseTargets(value ?? "");
+        const missing = rels.filter((rel) => !existsSync(path.resolve(process.cwd(), rel)));
+        if (missing.length > 0) return `El archivo no existe en el repo: ${missing.join(", ")}`;
       },
     })
   );
-  const targetRel = normalizeRel(String(targetRaw).trim() || DEFAULT_TARGET);
+  const targetRels = parseTargets(String(targetRaw));
 
   const modeRaw = handleCancel(
     await select({
@@ -170,7 +182,7 @@ async function main(): Promise<void> {
 
   log.info(pc.dim("Prompt recibido: ") + pc.white(promptText));
   log.info(pc.dim("Modo de seguridad: ") + pc.magenta(mode.label) + pc.dim(`  (${mode.llmCalls} llamada(s) LLM)`));
-  log.info(pc.dim("Archivo objetivo: ") + pc.cyan(targetRel));
+  log.info(pc.dim("Archivos objetivo: ") + pc.cyan(targetRels.join(", ")));
 
   const s = spinner();
   const ws = new ShadowWorkspace();
@@ -182,18 +194,16 @@ async function main(): Promise<void> {
     log.info(pc.dim("Fotocopia creada en: ") + pc.cyan(worktreePath));
 
     linkNodeModules(worktreePath);
-    ensureDemoFile(worktreePath, targetRel);
-
-    const fileContent = readFileSync(path.join(worktreePath, targetRel), "utf8");
+    for (const rel of targetRels) ensureDemoFile(worktreePath, rel);
 
     s.start("Llamando al LLM para proponer SEARCH/REPLACE...");
-    let proposal = await proposeChanges(promptText, targetRel, fileContent);
+    let proposal = await proposeChanges(promptText, targetRels);
     let blocks;
     try {
       blocks = LLMParser.parse(proposal.text);
     } catch {
       log.warn("La respuesta no tenia bloques validos. Reintentando una vez...");
-      proposal = await proposeCorrection(promptText, targetRel, fileContent, proposal.text);
+      proposal = await proposeCorrection(promptText, targetRels, proposal.text);
       try {
         blocks = LLMParser.parse(proposal.text);
       } catch {
@@ -204,27 +214,28 @@ async function main(): Promise<void> {
       }
     }
     blocks = withNormalizedPaths(blocks);
-    let missing = missingBlockPaths(worktreePath, blocks);
+    let missing = unauthorizedBlockPaths(blocks, targetRels);
     if (missing.length > 0) {
       const wrong = missing[0] ?? "(desconocida)";
-      log.warn(`Ruta de bloque no existe en la fotocopia: ${wrong}. Reintentando una vez...`);
+      const allowed = targetRels.join(", ");
+      log.warn(`Ruta de bloque no es un archivo objetivo: ${wrong}. Reintentando una vez...`);
       const pathCorrection =
-        `el archivo a modificar es exactamente ${targetRel}; tu bloque apuntaba a ${wrong}; responde solo con bloques corregidos`;
-      proposal = await proposeCorrection(promptText, targetRel, fileContent, proposal.text, pathCorrection);
+        `los archivos a modificar son exactamente ${allowed}; tu bloque apuntaba a ${wrong}; responde solo con bloques corregidos`;
+      proposal = await proposeCorrection(promptText, targetRels, proposal.text, pathCorrection);
       try {
         blocks = withNormalizedPaths(LLMParser.parse(proposal.text));
       } catch {
         s.stop();
         throw new Error(
-          `El LLM no devolvio bloques SEARCH/REPLACE validos al corregir la ruta. Objetivo: ${targetRel}.`
+          `El LLM no devolvio bloques SEARCH/REPLACE validos al corregir la ruta. Objetivos: ${allowed}.`
         );
       }
-      missing = missingBlockPaths(worktreePath, blocks);
+      missing = unauthorizedBlockPaths(blocks, targetRels);
       if (missing.length > 0) {
         s.stop();
         const stillWrong = missing[0] ?? wrong;
         throw new Error(
-          `El archivo del bloque no existe en la fotocopia (apuntaba a ${stillWrong}; el objetivo es ${targetRel}) tras 1 reintento.`
+          `El archivo del bloque no es un objetivo (apuntaba a ${stillWrong}; los objetivos son ${allowed}) tras 1 reintento.`
         );
       }
     }

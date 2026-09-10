@@ -44,11 +44,12 @@ async function lastCommitTs(root: string, relFile: string): Promise<number> {
   return Number.isFinite(ts) ? ts : Number.POSITIVE_INFINITY;
 }
 
-export async function buildContext(targetFile: string): Promise<string> {
+export async function buildContext(targetFiles: string[]): Promise<string> {
   const root = process.cwd();
   const parts: string[] = [];
   const order: string[] = [];
-  const targetRel = relFromRoot(root, targetFile);
+  const targetRels = targetFiles.map((file) => relFromRoot(root, file));
+  const targetSet = new Set(targetRels);
 
   const decisionsPath = path.join(root, "DECISIONS.md");
   if (existsSync(decisionsPath)) {
@@ -57,7 +58,7 @@ export async function buildContext(targetFile: string): Promise<string> {
     order.push("DECISIONS.md");
   }
 
-  const others = listSrcTs(root).filter((rel) => rel !== targetRel);
+  const others = listSrcTs(root).filter((rel) => !targetSet.has(rel));
   const dated = await Promise.all(
     others.map(async (rel) => ({ rel, ts: await lastCommitTs(root, rel) }))
   );
@@ -69,9 +70,11 @@ export async function buildContext(targetFile: string): Promise<string> {
     order.push(rel);
   }
 
-  const targetContent = readFileSync(path.resolve(root, targetFile), "utf8");
-  parts.push(`# ${targetRel}\n\n${targetContent}`);
-  order.push(targetRel);
+  for (const rel of targetRels) {
+    const targetContent = readFileSync(path.join(root, rel), "utf8");
+    parts.push(`# ${rel}\n\n${targetContent}`);
+    order.push(rel);
+  }
 
   const context = parts.join("\n\n");
   contextLog(`orden: ${order.join(" -> ")}`);
