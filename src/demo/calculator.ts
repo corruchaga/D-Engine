@@ -2,6 +2,10 @@ export function add(a: number, b: number): number {
   return a + b;
 }
 
+export function sum(arr: number[]): number {
+  return arr.reduce((acc, cur) => acc + cur, 0);
+}
+
 export function subtract(a: number, b: number): number {
   return a - b;
 }
