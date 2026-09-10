@@ -43,8 +43,7 @@ The toolbox is not the cost — **the agentic loop is**.
 | Avg time per task | ~2.7 s | ~38 s |
 | Broken commits on main | 0 | 1 (Aider, trap task) |
 
-Tied quality, **14–42× fewer tokens**, a predictable bill, zero broken merges. The full benchmark — frozen prompts, voided rows, hallucination incident and all — ships in [docs/benchmark.md](docs/benchmark.md) (Spanish, translation in progress).
-
+Tied quality, **14–42× fewer tokens**, a predictable bill, zero broken merges. The full benchmark — frozen prompts, voided rows, hallucination incident and all — ships in [docs/benchmark.en.md](docs/benchmark.en.md) ([español](docs/benchmark.md)).
 ## Install & usage
 
 Requirements: Node.js, git, TypeScript in the target repo (`tsc --noEmit`).
