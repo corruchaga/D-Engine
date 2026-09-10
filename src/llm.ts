@@ -1,4 +1,5 @@
 import { config } from "dotenv";
+import { buildContext } from "./context.js";
 
 config();
 
@@ -115,11 +116,12 @@ function userMessage(prompt: string, filePath: string, fileContent: string): str
 export async function proposeChanges(
   prompt: string,
   filePath: string,
-  fileContent: string
+  _fileContent: string
 ): Promise<ProposeResult> {
+  const context = await buildContext(filePath);
   return chatCompletions([
     { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: userMessage(prompt, filePath, fileContent) },
+    { role: "user", content: userMessage(prompt, filePath, context) },
   ]);
 }
 
