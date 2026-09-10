@@ -35,8 +35,8 @@ const MODES: Record<SecurityMode, ModeConfig> = {
     runAudit: true,
   },
   shadow: {
-    label: "Shadow",
-    description: "Aplica en fotocopia pero NO consolida",
+    label: "Shadow (1 llamada LLM, no consolida sin tu permiso)",
+    description: "1 llamada LLM, no consolida sin tu permiso",
     llmCalls: 1,
     runShadow: true,
     runCompile: true,
@@ -44,7 +44,7 @@ const MODES: Record<SecurityMode, ModeConfig> = {
   },
 };
 
-const DEMO_REL = path.join("src", "demo", "calculator.ts");
+const DEFAULT_TARGET = "src/demo/calculator.ts";
 
 function handleCancel<T>(value: T | symbol): T {
   if (isCancel(value)) {
@@ -84,9 +84,9 @@ function linkNodeModules(worktreePath: string): void {
   symlinkSync(src, dest, process.platform === "win32" ? "junction" : "dir");
 }
 
-function ensureDemoFile(worktreePath: string): void {
-  const src = path.join(process.cwd(), DEMO_REL);
-  const dest = path.join(worktreePath, DEMO_REL);
+function ensureDemoFile(worktreePath: string, rel: string): void {
+  const src = path.join(process.cwd(), rel);
+  const dest = path.join(worktreePath, rel);
   mkdirSync(path.dirname(dest), { recursive: true });
   copyFileSync(src, dest);
 }
@@ -129,6 +129,20 @@ async function main(): Promise<void> {
     })
   );
 
+  const targetRaw = handleCancel(
+    await text({
+      message: "¿Archivo objetivo?",
+      placeholder: DEFAULT_TARGET,
+      defaultValue: DEFAULT_TARGET,
+      validate: (value) => {
+        const rel = normalizeRel((value ?? "").trim() || DEFAULT_TARGET);
+        const abs = path.resolve(process.cwd(), rel);
+        if (!existsSync(abs)) return `El archivo no existe en el repo: ${rel}`;
+      },
+    })
+  );
+  const targetRel = normalizeRel(String(targetRaw).trim() || DEFAULT_TARGET);
+
   const modeRaw = handleCancel(
     await select({
       message: "Selecciona el modo de seguridad:",
@@ -156,8 +170,7 @@ async function main(): Promise<void> {
 
   log.info(pc.dim("Prompt recibido: ") + pc.white(promptText));
   log.info(pc.dim("Modo de seguridad: ") + pc.magenta(mode.label) + pc.dim(`  (${mode.llmCalls} llamada(s) LLM)`));
-  const demoPath = DEMO_REL.replaceAll("\\", "/");
-  log.info(pc.dim("Archivo objetivo: ") + pc.cyan(demoPath));
+  log.info(pc.dim("Archivo objetivo: ") + pc.cyan(targetRel));
 
   const s = spinner();
   const ws = new ShadowWorkspace();
@@ -169,18 +182,18 @@ async function main(): Promise<void> {
     log.info(pc.dim("Fotocopia creada en: ") + pc.cyan(worktreePath));
 
     linkNodeModules(worktreePath);
-    ensureDemoFile(worktreePath);
+    ensureDemoFile(worktreePath, targetRel);
 
-    const fileContent = readFileSync(path.join(worktreePath, DEMO_REL), "utf8");
+    const fileContent = readFileSync(path.join(worktreePath, targetRel), "utf8");
 
     s.start("Llamando al LLM para proponer SEARCH/REPLACE...");
-    let proposal = await proposeChanges(promptText, demoPath, fileContent);
+    let proposal = await proposeChanges(promptText, targetRel, fileContent);
     let blocks;
     try {
       blocks = LLMParser.parse(proposal.text);
     } catch {
       log.warn("La respuesta no tenia bloques validos. Reintentando una vez...");
-      proposal = await proposeCorrection(promptText, demoPath, fileContent, proposal.text);
+      proposal = await proposeCorrection(promptText, targetRel, fileContent, proposal.text);
       try {
         blocks = LLMParser.parse(proposal.text);
       } catch {
@@ -196,14 +209,14 @@ async function main(): Promise<void> {
       const wrong = missing[0] ?? "(desconocida)";
       log.warn(`Ruta de bloque no existe en la fotocopia: ${wrong}. Reintentando una vez...`);
       const pathCorrection =
-        `el archivo a modificar es exactamente ${demoPath}; tu bloque apuntaba a ${wrong}; responde solo con bloques corregidos`;
-      proposal = await proposeCorrection(promptText, demoPath, fileContent, proposal.text, pathCorrection);
+        `el archivo a modificar es exactamente ${targetRel}; tu bloque apuntaba a ${wrong}; responde solo con bloques corregidos`;
+      proposal = await proposeCorrection(promptText, targetRel, fileContent, proposal.text, pathCorrection);
       try {
         blocks = withNormalizedPaths(LLMParser.parse(proposal.text));
       } catch {
         s.stop();
         throw new Error(
-          `El LLM no devolvio bloques SEARCH/REPLACE validos al corregir la ruta. Objetivo: ${demoPath}.`
+          `El LLM no devolvio bloques SEARCH/REPLACE validos al corregir la ruta. Objetivo: ${targetRel}.`
         );
       }
       missing = missingBlockPaths(worktreePath, blocks);
@@ -211,7 +224,7 @@ async function main(): Promise<void> {
         s.stop();
         const stillWrong = missing[0] ?? wrong;
         throw new Error(
-          `El archivo del bloque no existe en la fotocopia (apuntaba a ${stillWrong}; el objetivo es ${demoPath}) tras 1 reintento.`
+          `El archivo del bloque no existe en la fotocopia (apuntaba a ${stillWrong}; el objetivo es ${targetRel}) tras 1 reintento.`
         );
       }
     }
@@ -257,22 +270,27 @@ async function main(): Promise<void> {
       if (!auditOk) {
         log.info(pc.dim("Puerta semantica rechazo el cambio."));
       } else if (mode.runShadow) {
-        log.warn(
-          pc.yellow("Modo shadow: los cambios solo existen en la fotocopia. " + pc.bold("NO se consolidaron en el disco real."))
-        );
+        const diff = await ws.diffHead();
+        if (diff.trim().length > 0) {
+          log.message(diff);
+        } else {
+          log.info(pc.dim("(sin cambios)"));
+        }
 
         const consolidate = handleCancel(
           await confirm({
-            message: "Consolidar los cambios de la fotocopia al disco real?",
-            active: "Consolidar",
-            inactive: "Descartar (rollback)",
+            message: "¿Consolidar? (sí/no)",
+            active: "sí",
+            inactive: "no",
           })
         );
 
         if (consolidate) {
-          await mergeChanges(ws, "D-Engine: cambios consolidados");
+          await mergeChanges(ws, "D-Engine: cambios consolidados en modo shadow");
         } else {
-          log.info(pc.dim("Fotocopia descartada. Nada se consolido."));
+          await destroyShadow(s, ws);
+          shadowCreated = false;
+          log.info("ensayo descartado, rama real intacta");
         }
       } else {
         await mergeChanges(
