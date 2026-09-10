@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { intro, outro, text, select, confirm, spinner, log, cancel, isCancel } from "@clack/prompts";
 import pc from "picocolors";
+import { ShadowWorkspace } from "./engine.js";
 
 type SecurityMode = "fast" | "verify" | "shadow";
 
@@ -63,6 +64,25 @@ async function runPhase(spin: SpinnerLike, phase: string, ms: number): Promise<v
   spin.stop();
 }
 
+async function createShadow(spin: SpinnerLike, ws: ShadowWorkspace): Promise<string> {
+  spin.start("Creando fotocopia (git worktree)...");
+  try {
+    const path = await ws.create();
+    return path;
+  } finally {
+    spin.stop();
+  }
+}
+
+async function destroyShadow(spin: SpinnerLike, ws: ShadowWorkspace): Promise<void> {
+  spin.start("Destruyendo fotocopia (rollback)...");
+  try {
+    await ws.destroy();
+  } finally {
+    spin.stop();
+  }
+}
+
 async function main(): Promise<void> {
   intro(pc.bold(pc.cyan("D-Engine")) + pc.dim("  — la IA piensa, la puerta decide."));
 
@@ -107,11 +127,15 @@ async function main(): Promise<void> {
   log.info(pc.dim("Modo de seguridad: ") + pc.magenta(mode.label) + pc.dim(`  (${mode.llmCalls} llamada(s) LLM)`));
 
   const s = spinner();
+  const ws = new ShadowWorkspace();
+  let shadowCreated = false;
 
   const doRun = async () => {
     // 1. Generar propuesta (fotocopia git worktree)
     await runPhase(s, "Llamando al LLM para proponer cambios semanticos (SEARCH/REPLACE)...", 1200);
-    await runPhase(s, "Creando fotocopia (git worktree)...", 700);
+    const worktreePath = await createShadow(s, ws);
+    shadowCreated = true;
+    log.info(pc.dim("Fotocopia creada en: ") + pc.cyan(worktreePath));
 
     // 2. Compilador local = puerta determinista (verify y shadow)
     if (mode.runCompile) {
@@ -127,35 +151,49 @@ async function main(): Promise<void> {
     }
   };
 
-  if (mode.runShadow) {
-    await doRun();
-    log.warn(
-      pc.yellow("Modo shadow: los cambios solo existen en la fotocopia. " + pc.bold("NO se consolidaron en el disco real."))
-    );
+  try {
+    if (mode.runShadow) {
+      await doRun();
+      log.warn(
+        pc.yellow("Modo shadow: los cambios solo existen en la fotocopia. " + pc.bold("NO se consolidaron en el disco real."))
+      );
 
-    const consolidate = handleCancel(
-      await confirm({
-        message: "Consolidar los cambios de la fotocopia al disco real?",
-        active: "Consolidar",
-        inactive: "Descartar (rollback)",
-      })
-    );
+      const consolidate = handleCancel(
+        await confirm({
+          message: "Consolidar los cambios de la fotocopia al disco real?",
+          active: "Consolidar",
+          inactive: "Descartar (rollback)",
+        })
+      );
 
-    if (consolidate) {
-      await runPhase(s, "Consolidando cambios en disco real...", 800);
-      log.success(pc.green("Cambios consolidados."));
+      if (consolidate) {
+        const merged = await ws.commitAndMerge("D-Engine: cambios consolidados");
+        if (merged) {
+          log.success(pc.green("Cambios consolidados."));
+        } else {
+          log.info(pc.dim("Sin cambios que consolidar en la fotocopia."));
+        }
+      } else {
+        log.info(pc.dim("Fotocopia descartada. Nada se consolido."));
+      }
     } else {
-      await runPhase(s, "Rollback: descartando la fotocopia...", 600);
-      log.info(pc.dim("Fotocopia descartada. Nada se consolido."));
+      // modo fast: aplica directo y consolida
+      await doRun();
+      const merged = await ws.commitAndMerge("D-Engine: cambios consolidados en modo fast");
+      if (merged) {
+        log.success(pc.green("Cambios consolidados en modo fast."));
+      } else {
+        log.info(pc.dim("Sin cambios que consolidar en la fotocopia."));
+      }
     }
-  } else {
-    // modo fast: aplica directo y consolida
-    await doRun();
-    await runPhase(s, "Consolidando cambios en disco real (1 sola llamada)...", 800);
-    log.success(pc.green("Cambios consolidados en modo fast."));
-  }
 
-  outro(pc.cyan("D-Engine") + pc.dim(" finalizado."));
+    outro(pc.cyan("D-Engine") + pc.dim(" finalizado."));
+  } finally {
+    if (shadowCreated) {
+      await destroyShadow(s, ws);
+      log.info(pc.dim("Fotocopia y rama temporal eliminadas."));
+    }
+  }
 
   process.exit(0);
 }
