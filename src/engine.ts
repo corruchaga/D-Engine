@@ -1,5 +1,6 @@
 import { execa } from "execa";
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -91,6 +92,16 @@ export class ShadowWorkspace {
       cwd: root,
       allowFail: true,
     });
+
+    if (this.worktreePath && existsSync(this.worktreePath)) {
+      try {
+        await rm(this.worktreePath, { recursive: true, force: true });
+        gitLog("carpeta residual eliminada");
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        gitLog(`no se pudo eliminar la carpeta física: ${reason}`);
+      }
+    }
 
     if (this.branch) {
       await runGit(["branch", "-D", this.branch], "borrar rama temporal (despues)", {
