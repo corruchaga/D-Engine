@@ -1,7 +1,7 @@
 {
   "name": "d-engine",
   "version": "0.2.2",
-  "description": "CLI determinista de edicion de codigo con IA: la IA propone, el motor decide.",
+  "description": "CLI determinista de edicion de codigo con LLM: la IA propone SEARCH/REPLACE, la puerta local decide.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -24,8 +24,9 @@
     "editor",
     "deterministic"
   ],
-  "author": "",
+  "author": "Sergi Corruchaga",
   "license": "MIT",
+  "repository": "https://github.com/USUARIO/D-Engine",
   "devDependencies": {
     "@types/node": "^26.5.0",
     "tsx": "^4.23.13",
