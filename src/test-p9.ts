@@ -6,6 +6,7 @@ import {
   packSelectorCatalog,
   type SelectorCatalogFile,
 } from "./context.js";
+import { SELECTOR_SYSTEM } from "./llm.js";
 import { parseSelectorResponse, validateSelectorPaths } from "./selector.js";
 
 let passed = 0;
@@ -31,6 +32,13 @@ function entry(rel: string, extra?: Partial<SelectorCatalogFile>): SelectorCatal
     ...extra,
   };
 }
+
+assert(
+  SELECTOR_SYSTEM.includes("MINIMO conjunto") &&
+    SELECTOR_SYSTEM.includes("por si acaso") &&
+    /importen o usen/i.test(SELECTOR_SYSTEM),
+  "prompt del selector pide minimo conjunto"
+);
 
 const candidates = ["src/engine.ts", "src/index.ts", "src/llm.ts"];
 

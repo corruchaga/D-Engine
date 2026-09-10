@@ -9,6 +9,15 @@ interface GitOptions {
   allowFail?: boolean;
 }
 
+export class PorcelainGuardError extends Error {
+  readonly files: string[];
+  constructor(files: string[]) {
+    super(`La fotocopia tiene cambios fuera de los archivos del parche: ${files.join(", ")}`);
+    this.name = "PorcelainGuardError";
+    this.files = files;
+  }
+}
+
 function gitLog(message: string): void {
   console.log(`[d-engine:git] ${message}`);
 }
@@ -66,6 +75,19 @@ async function runGit(args: string[], action: string, options: GitOptions = {}):
       return "";
     }
     throw new Error(`git no pudo ${action}: ${info}`);
+  }
+}
+
+async function logOffendingDiffs(cwd: string, files: string[]): Promise<void> {
+  for (const rel of files) {
+    await runGit(["diff", "HEAD", "--", rel], `diff HEAD -- ${rel} (ofensor)`, {
+      cwd,
+      allowFail: true,
+    });
+    await runGit(["diff", "--cached", "--", rel], `diff --cached -- ${rel} (ofensor)`, {
+      cwd,
+      allowFail: true,
+    });
   }
 }
 
@@ -168,9 +190,8 @@ export class ShadowWorkspace {
     const dirty = parsePorcelainPaths(porcelain);
     const extra = [...new Set(dirty.filter((rel) => !allowedSet.has(rel)))];
     if (extra.length > 0) {
-      throw new Error(
-        `La fotocopia tiene cambios fuera de los archivos del parche: ${extra.join(", ")}`
-      );
+      await logOffendingDiffs(photocopy, extra);
+      throw new PorcelainGuardError(extra);
     }
 
     if (allowed.length === 0) {
@@ -193,9 +214,8 @@ export class ShadowWorkspace {
       .filter(Boolean);
     const stagedExtra = stagedFiles.filter((rel) => !allowedSet.has(rel));
     if (stagedExtra.length > 0) {
-      throw new Error(
-        `La fotocopia tiene staged fuera de los archivos del parche: ${stagedExtra.join(", ")}`
-      );
+      await logOffendingDiffs(photocopy, stagedExtra);
+      throw new PorcelainGuardError(stagedExtra);
     }
 
     if (stagedFiles.length === 0) {

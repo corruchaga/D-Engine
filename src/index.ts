@@ -3,7 +3,7 @@ import { intro, outro, text, select, confirm, spinner, log, cancel, isCancel } f
 import { copyFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
 import path from "node:path";
 import pc from "picocolors";
-import { LLMParser, LocalEditor, ShadowWorkspace, Validator, type EditBlock } from "./engine.js";
+import { LLMParser, LocalEditor, PorcelainGuardError, ShadowWorkspace, Validator, type EditBlock } from "./engine.js";
 import { buildSelectorCatalog } from "./context.js";
 import { parseVerifyVerdict, proposeChanges, proposeCorrection, selectTargetFiles, verifyChanges } from "./llm.js";
 import { normalizeRel, resolveSelectorPaths } from "./selector.js";
@@ -102,8 +102,10 @@ function linkNodeModules(worktreePath: string): void {
 }
 
 function ensureDemoFile(worktreePath: string, rel: string): void {
-  const src = path.join(process.cwd(), rel);
   const dest = path.join(worktreePath, rel);
+  if (existsSync(dest)) return;
+  const src = path.join(process.cwd(), rel);
+  if (!existsSync(src)) return;
   mkdirSync(path.dirname(dest), { recursive: true });
   copyFileSync(src, dest);
 }
@@ -221,11 +223,23 @@ function unauthorizedBlockPaths(blocks: EditBlock[], targets: string[]): string[
 }
 
 async function mergeChanges(ws: ShadowWorkspace, message: string, files: string[]): Promise<void> {
-  const merged = await ws.commitAndMerge(message, files);
-  if (merged) {
-    log.success(pc.green("Cambios consolidados en la rama real."));
-  } else {
-    log.info(pc.dim("Sin cambios que consolidar en la fotocopia."));
+  try {
+    const merged = await ws.commitAndMerge(message, files);
+    if (merged) {
+      log.success(pc.green("Cambios consolidados en la rama real."));
+    } else {
+      log.info(pc.dim("Sin cambios que consolidar en la fotocopia."));
+    }
+  } catch (error) {
+    if (error instanceof PorcelainGuardError) {
+      log.error(
+        pc.red(
+          `La puerta rechazo el cambio: se detectaron modificaciones fuera de los archivos del parche: ${error.files.join(", ")}. Nada se consolida.`
+        )
+      );
+      return;
+    }
+    throw error;
   }
 }
 
@@ -286,7 +300,6 @@ async function main(): Promise<void> {
     log.info(pc.dim("Fotocopia creada en: ") + pc.cyan(worktreePath));
 
     linkNodeModules(worktreePath);
-    for (const rel of targetRels) ensureDemoFile(worktreePath, rel);
 
     s.start("Llamando al LLM para proponer SEARCH/REPLACE...");
     let proposal = await proposeChanges(promptText, targetRels);
@@ -335,6 +348,7 @@ async function main(): Promise<void> {
       }
     }
 
+    for (const block of blocks) ensureDemoFile(worktreePath, block.filePath);
     let applied = blocks.map((block) => LocalEditor.apply(worktreePath, block));
     s.stop();
     for (const result of applied) {
@@ -377,6 +391,7 @@ async function main(): Promise<void> {
           `El archivo del bloque no es un objetivo (apuntaba a ${stillWrong}; los objetivos son ${targetRels.join(", ")}) al corregir la compilacion.`
         );
       }
+      for (const block of blocks) ensureDemoFile(worktreePath, block.filePath);
       applied = blocks.map((block) => LocalEditor.apply(worktreePath, block));
       s.stop();
       for (const result of applied) {

@@ -112,7 +112,7 @@ async function chatCompletions(messages: ChatMessage[], options: ChatOptions = {
   return { text, tokensIn, tokensOut };
 }
 
-const SELECTOR_SYSTEM = `Eres un selector de archivos. Responde UNICAMENTE un JSON array de strings con rutas posix del catalogo. Ejemplo: ["src/engine.ts"]. Prohibido markdown, explicaciones o rutas fuera de la lista.`;
+export const SELECTOR_SYSTEM = `Eres un selector de archivos. Responde UNICAMENTE un JSON array de strings con rutas posix del catalogo. Ejemplo: ["src/engine.ts"]. Prohibido markdown, explicaciones o rutas fuera de la lista. Elige el MINIMO conjunto necesario: los archivos a modificar Y, si el prompt pide actualizar usos, los que importen o usen esos simbolos. No incluyas archivos por si acaso.`;
 
 function selectorUser(prompt: string, catalogText: string): string {
   return [`Prompt del usuario:`, prompt, ``, `Catalogo:`, catalogText].join("\n");
