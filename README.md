@@ -28,7 +28,7 @@ Benchmark completo y reproducible: [docs/benchmark.md](docs/benchmark.md)
 Requisitos: Node.js, git, TypeScript en el repo objetivo (`tsc --noEmit`).
 
 ```bash
-git clone https://github.com/USUARIO/D-Engine
+git clone https://github.com/corruchaga/D-Engine
 cd D-Engine
 npm install
 cp .env.example .env
