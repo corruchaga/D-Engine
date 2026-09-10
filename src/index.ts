@@ -4,7 +4,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "
 import path from "node:path";
 import pc from "picocolors";
 import { LLMParser, LocalEditor, ShadowWorkspace, Validator, type EditBlock } from "./engine.js";
-import { proposeChanges, proposeCorrection } from "./llm.js";
+import { parseVerifyVerdict, proposeChanges, proposeCorrection, verifyChanges } from "./llm.js";
 
 type SecurityMode = "fast" | "verify" | "shadow";
 
@@ -30,7 +30,7 @@ const MODES: Record<SecurityMode, ModeConfig> = {
     label: "Verify",
     description: "Auditoria semantica con 2da llamada",
     llmCalls: 2,
-    runShadow: true,
+    runShadow: false,
     runCompile: true,
     runAudit: true,
   },
@@ -234,11 +234,29 @@ async function main(): Promise<void> {
     } else {
       log.success(pc.green("Compilacion OK: la fotocopia es valida."));
 
+      let auditOk = true;
       if (mode.runAudit) {
-        log.info(pc.dim("Auditoria semantica: pendiente de conectar al LLM (sin llamada simulada)."));
+        s.start("Auditoria semantica (2da llamada LLM)...");
+        const diff = await ws.diffHead();
+        const audit = await verifyChanges(promptText, diff);
+        s.stop();
+        const verdict = parseVerifyVerdict(audit.text);
+        if (verdict.ok) {
+          if (verdict.reason) {
+            log.success(pc.green("Auditoria OK_CON_OBSERVACIONES: ") + verdict.reason);
+          } else {
+            log.success(pc.green("Auditoria OK: el diff cumple el requisito."));
+          }
+        } else {
+          auditOk = false;
+          log.error(pc.red("Auditoria FALLO: ") + (verdict.reason || audit.text.trim()));
+          log.info(pc.dim("Nada se consolida."));
+        }
       }
 
-      if (mode.runShadow) {
+      if (!auditOk) {
+        log.info(pc.dim("Puerta semantica rechazo el cambio."));
+      } else if (mode.runShadow) {
         log.warn(
           pc.yellow("Modo shadow: los cambios solo existen en la fotocopia. " + pc.bold("NO se consolidaron en el disco real."))
         );
@@ -257,7 +275,10 @@ async function main(): Promise<void> {
           log.info(pc.dim("Fotocopia descartada. Nada se consolido."));
         }
       } else {
-        await mergeChanges(ws, "D-Engine: cambios consolidados en modo fast");
+        await mergeChanges(
+          ws,
+          mode.runAudit ? "D-Engine: cambios consolidados en modo verify" : "D-Engine: cambios consolidados en modo fast"
+        );
       }
     }
 

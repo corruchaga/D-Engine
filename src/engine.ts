@@ -172,6 +172,17 @@ export class ShadowWorkspace {
     const root = this.repoRoot || process.cwd();
     return (await runGit(["log", "-1", "--oneline"], "git log -1 (master/HEAD)", { cwd: root })).trim();
   }
+
+  async diffHead(): Promise<string> {
+    const photocopy = this.worktreePath;
+    gitLog("diff HEAD en la FOTOCOPIA");
+    gitLog(`  cwd: ${photocopy}`);
+    gitLog("  $ git diff HEAD");
+    const result = await execa("git", ["diff", "HEAD"], { cwd: photocopy, reject: false });
+    const stdout = result.stdout.trim();
+    gitLog(stdout.length > 0 ? `  ok stdout:\n${stdout}` : "  ok (sin stdout)");
+    return result.stdout;
+  }
 }
 
 export interface EditBlock {

@@ -123,6 +123,40 @@ export async function proposeChanges(
   ]);
 }
 
+const VERIFY_SYSTEM = `Eres un auditor semantico. Recibes un REQUISITO y un DIFF. Responde con exactamente una linea, sin markdown:
+
+- OK — el diff cumple el requisito explicito del usuario.
+- OK_CON_OBSERVACIONES: <notas> — el requisito se cumple; hay detalles menores de estilo, nombres de tags o convenciones. Eso NO es FALLO.
+- FALLO: <motivo> — UNICAMENTE si el diff no cumple una parte explicita del requisito o introduce un comportamiento incorrecto.
+
+No rechaces por estilo, nombres de tags ni convenciones. Esos casos son OK_CON_OBSERVACIONES, nunca FALLO.`;
+
+export async function verifyChanges(prompt: string, diff: string): Promise<ProposeResult> {
+  return chatCompletions([
+    { role: "system", content: VERIFY_SYSTEM },
+    {
+      role: "user",
+      content: [`REQUISITO:`, prompt, ``, `DIFF:`, diff.trim().length > 0 ? diff : "(sin cambios)"].join("\n"),
+    },
+  ]);
+}
+
+export function parseVerifyVerdict(text: string): { ok: boolean; reason: string } {
+  const line = text.trim().split(/\r?\n/)[0]?.trim() ?? "";
+  const fallo = /^FALLO:\s*(.*)$/i.exec(line);
+  if (fallo) {
+    return { ok: false, reason: (fallo[1] ?? "").trim() || "auditoria rechazada" };
+  }
+  const notes = /^OK_CON_OBSERVACIONES:\s*(.*)$/i.exec(line);
+  if (notes) {
+    return { ok: true, reason: (notes[1] ?? "").trim() };
+  }
+  if (/^OK\s*$/i.test(line)) {
+    return { ok: true, reason: "" };
+  }
+  return { ok: false, reason: line || "auditoria rechazada" };
+}
+
 export async function proposeCorrection(
   prompt: string,
   filePath: string,
