@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { intro, outro, text, select, confirm, spinner, log, cancel, isCancel } from "@clack/prompts";
-import { copyFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs";
 import path from "node:path";
 import pc from "picocolors";
-import { LLMParser, LocalEditor, ShadowWorkspace, Validator } from "./engine.js";
+import { LLMParser, LocalEditor, ShadowWorkspace, Validator, type EditBlock } from "./engine.js";
+import { proposeChanges, proposeCorrection } from "./llm.js";
 
 type SecurityMode = "fast" | "verify" | "shadow";
 
@@ -44,22 +45,6 @@ const MODES: Record<SecurityMode, ModeConfig> = {
 };
 
 const DEMO_REL = path.join("src", "demo", "calculator.ts");
-
-const DEMO_PATCH = `${DEMO_REL.replaceAll("\\", "/")}
-<<<<<<< SEARCH
-export function subtract(a: number, b: number): number {
-  return a - b;
-}
-=======
-export function subtract(a: number, b: number): number {
-  return a - b;
-}
-
-export function divide(a: number, b: number): number {
-  return "resultado";
-}
->>>>>>> REPLACE
-`;
 
 function handleCancel<T>(value: T | symbol): T {
   if (isCancel(value)) {
@@ -104,6 +89,20 @@ function ensureDemoFile(worktreePath: string): void {
   const dest = path.join(worktreePath, DEMO_REL);
   mkdirSync(path.dirname(dest), { recursive: true });
   copyFileSync(src, dest);
+}
+
+function normalizeRel(rel: string): string {
+  return rel.replaceAll("\\", "/").replace(/^\.\//, "");
+}
+
+function withNormalizedPaths(blocks: EditBlock[]): EditBlock[] {
+  return blocks.map((block) => ({ ...block, filePath: normalizeRel(block.filePath) }));
+}
+
+function missingBlockPaths(worktreePath: string, blocks: EditBlock[]): string[] {
+  return blocks
+    .map((block) => block.filePath)
+    .filter((rel) => !existsSync(path.join(worktreePath, rel)));
 }
 
 async function mergeChanges(ws: ShadowWorkspace, message: string): Promise<void> {
@@ -157,7 +156,8 @@ async function main(): Promise<void> {
 
   log.info(pc.dim("Prompt recibido: ") + pc.white(promptText));
   log.info(pc.dim("Modo de seguridad: ") + pc.magenta(mode.label) + pc.dim(`  (${mode.llmCalls} llamada(s) LLM)`));
-  log.info(pc.dim("Esta fase aplica un bloque SEARCH/REPLACE de prueba sobre ") + pc.cyan(DEMO_REL.replaceAll("\\", "/")));
+  const demoPath = DEMO_REL.replaceAll("\\", "/");
+  log.info(pc.dim("Archivo objetivo: ") + pc.cyan(demoPath));
 
   const s = spinner();
   const ws = new ShadowWorkspace();
@@ -171,8 +171,51 @@ async function main(): Promise<void> {
     linkNodeModules(worktreePath);
     ensureDemoFile(worktreePath);
 
-    s.start("Aplicando bloque SEARCH/REPLACE en la fotocopia...");
-    const blocks = LLMParser.parse(DEMO_PATCH);
+    const fileContent = readFileSync(path.join(worktreePath, DEMO_REL), "utf8");
+
+    s.start("Llamando al LLM para proponer SEARCH/REPLACE...");
+    let proposal = await proposeChanges(promptText, demoPath, fileContent);
+    let blocks;
+    try {
+      blocks = LLMParser.parse(proposal.text);
+    } catch {
+      log.warn("La respuesta no tenia bloques validos. Reintentando una vez...");
+      proposal = await proposeCorrection(promptText, demoPath, fileContent, proposal.text);
+      try {
+        blocks = LLMParser.parse(proposal.text);
+      } catch {
+        s.stop();
+        throw new Error(
+          "El LLM no devolvio bloques SEARCH/REPLACE validos tras 2 intentos. Revisa el modelo o el prompt."
+        );
+      }
+    }
+    blocks = withNormalizedPaths(blocks);
+    let missing = missingBlockPaths(worktreePath, blocks);
+    if (missing.length > 0) {
+      const wrong = missing[0] ?? "(desconocida)";
+      log.warn(`Ruta de bloque no existe en la fotocopia: ${wrong}. Reintentando una vez...`);
+      const pathCorrection =
+        `el archivo a modificar es exactamente ${demoPath}; tu bloque apuntaba a ${wrong}; responde solo con bloques corregidos`;
+      proposal = await proposeCorrection(promptText, demoPath, fileContent, proposal.text, pathCorrection);
+      try {
+        blocks = withNormalizedPaths(LLMParser.parse(proposal.text));
+      } catch {
+        s.stop();
+        throw new Error(
+          `El LLM no devolvio bloques SEARCH/REPLACE validos al corregir la ruta. Objetivo: ${demoPath}.`
+        );
+      }
+      missing = missingBlockPaths(worktreePath, blocks);
+      if (missing.length > 0) {
+        s.stop();
+        const stillWrong = missing[0] ?? wrong;
+        throw new Error(
+          `El archivo del bloque no existe en la fotocopia (apuntaba a ${stillWrong}; el objetivo es ${demoPath}) tras 1 reintento.`
+        );
+      }
+    }
+
     const applied = blocks.map((block) => LocalEditor.apply(worktreePath, block));
     s.stop();
     for (const result of applied) {
