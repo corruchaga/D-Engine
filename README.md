@@ -91,5 +91,3 @@ The TUI asks for: change description, target file (empty Enter = automatic selec
 ## License
 
 MIT. Copyright (c) 2026 Sergi Corruchaga.
-
-📄 Article: [The AI thinks, the gate decides — how I made LLM code edits deterministic (42× fewer tokens)](https://dev.to/sergiocorruchaga/the-ai-thinks-the-gate-decides-how-i-made-llm-code-edits-deterministic-and-cut-token-usage-42x-5cbi)
