@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { intro, outro, text, select, confirm, spinner, log, cancel, isCancel } from "@clack/prompts";
+import { copyFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
+import path from "node:path";
 import pc from "picocolors";
-import { ShadowWorkspace } from "./engine.js";
+import { LLMParser, LocalEditor, ShadowWorkspace, Validator } from "./engine.js";
 
 type SecurityMode = "fast" | "verify" | "shadow";
 
@@ -41,9 +43,23 @@ const MODES: Record<SecurityMode, ModeConfig> = {
   },
 };
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+const DEMO_REL = path.join("src", "demo", "calculator.ts");
+
+const DEMO_PATCH = `${DEMO_REL.replaceAll("\\", "/")}
+<<<<<<< SEARCH
+export function subtract(a: number, b: number): number {
+  return a - b;
 }
+=======
+export function subtract(a: number, b: number): number {
+  return a - b;
+}
+
+export function multiply(a: number, b: number): number {
+  return a * b;
+}
+>>>>>>> REPLACE
+`;
 
 function handleCancel<T>(value: T | symbol): T {
   if (isCancel(value)) {
@@ -58,17 +74,10 @@ interface SpinnerLike {
   stop: (msg?: string, code?: number) => void;
 }
 
-async function runPhase(spin: SpinnerLike, phase: string, ms: number): Promise<void> {
-  spin.start(phase);
-  await sleep(ms);
-  spin.stop();
-}
-
 async function createShadow(spin: SpinnerLike, ws: ShadowWorkspace): Promise<string> {
   spin.start("Creando fotocopia (git worktree)...");
   try {
-    const path = await ws.create();
-    return path;
+    return await ws.create();
   } finally {
     spin.stop();
   }
@@ -80,6 +89,29 @@ async function destroyShadow(spin: SpinnerLike, ws: ShadowWorkspace): Promise<vo
     await ws.destroy();
   } finally {
     spin.stop();
+  }
+}
+
+function linkNodeModules(worktreePath: string): void {
+  const src = path.join(process.cwd(), "node_modules");
+  const dest = path.join(worktreePath, "node_modules");
+  if (!existsSync(src) || existsSync(dest)) return;
+  symlinkSync(src, dest, process.platform === "win32" ? "junction" : "dir");
+}
+
+function ensureDemoFile(worktreePath: string): void {
+  const src = path.join(process.cwd(), DEMO_REL);
+  const dest = path.join(worktreePath, DEMO_REL);
+  mkdirSync(path.dirname(dest), { recursive: true });
+  copyFileSync(src, dest);
+}
+
+async function mergeChanges(ws: ShadowWorkspace, message: string): Promise<void> {
+  const merged = await ws.commitAndMerge(message);
+  if (merged) {
+    log.success(pc.green("Cambios consolidados en la rama real."));
+  } else {
+    log.info(pc.dim("Sin cambios que consolidar en la fotocopia."));
   }
 }
 
@@ -125,65 +157,64 @@ async function main(): Promise<void> {
 
   log.info(pc.dim("Prompt recibido: ") + pc.white(promptText));
   log.info(pc.dim("Modo de seguridad: ") + pc.magenta(mode.label) + pc.dim(`  (${mode.llmCalls} llamada(s) LLM)`));
+  log.info(pc.dim("Esta fase aplica un bloque SEARCH/REPLACE de prueba sobre ") + pc.cyan(DEMO_REL.replaceAll("\\", "/")));
 
   const s = spinner();
   const ws = new ShadowWorkspace();
   let shadowCreated = false;
 
-  const doRun = async () => {
-    // 1. Generar propuesta (fotocopia git worktree)
-    await runPhase(s, "Llamando al LLM para proponer cambios semanticos (SEARCH/REPLACE)...", 1200);
+  try {
     const worktreePath = await createShadow(s, ws);
     shadowCreated = true;
     log.info(pc.dim("Fotocopia creada en: ") + pc.cyan(worktreePath));
 
-    // 2. Compilador local = puerta determinista (verify y shadow)
-    if (mode.runCompile) {
-      await runPhase(s, "Aplicando cambios en la fotocopia...", 800);
-      await runPhase(s, "Compilando como puerta (tsc --noEmit)...", 900);
-      log.success(pc.green("Compilacion OK: la fotocopia es valida."));
+    linkNodeModules(worktreePath);
+    ensureDemoFile(worktreePath);
+
+    s.start("Aplicando bloque SEARCH/REPLACE en la fotocopia...");
+    const blocks = LLMParser.parse(DEMO_PATCH);
+    const applied = blocks.map((block) => LocalEditor.apply(worktreePath, block));
+    s.stop();
+    for (const result of applied) {
+      log.success(pc.green(`Parche aplicado en ${result.filePath} (${result.strategy})`));
     }
 
-    // 3. Auditoria semantica opcional = 2da llamada barata
-    if (mode.runAudit) {
-      await runPhase(s, "Enviando diff a auditoria semantica (2da llamada LLM)...", 1100);
-      log.success(pc.green("Auditoria aprobada: el cambio es coherente."));
-    }
-  };
+    s.start("Compilando como puerta (tsc --noEmit)...");
+    const check = await Validator.run(worktreePath);
+    s.stop();
 
-  try {
-    if (mode.runShadow) {
-      await doRun();
-      log.warn(
-        pc.yellow("Modo shadow: los cambios solo existen en la fotocopia. " + pc.bold("NO se consolidaron en el disco real."))
-      );
-
-      const consolidate = handleCancel(
-        await confirm({
-          message: "Consolidar los cambios de la fotocopia al disco real?",
-          active: "Consolidar",
-          inactive: "Descartar (rollback)",
-        })
-      );
-
-      if (consolidate) {
-        const merged = await ws.commitAndMerge("D-Engine: cambios consolidados");
-        if (merged) {
-          log.success(pc.green("Cambios consolidados."));
-        } else {
-          log.info(pc.dim("Sin cambios que consolidar en la fotocopia."));
-        }
-      } else {
-        log.info(pc.dim("Fotocopia descartada. Nada se consolido."));
+    if (!check.ok) {
+      log.error(pc.red("La puerta de compilacion rechazo el cambio. Nada se consolida."));
+      if (check.output.length > 0) {
+        log.message(check.output);
       }
     } else {
-      // modo fast: aplica directo y consolida
-      await doRun();
-      const merged = await ws.commitAndMerge("D-Engine: cambios consolidados en modo fast");
-      if (merged) {
-        log.success(pc.green("Cambios consolidados en modo fast."));
+      log.success(pc.green("Compilacion OK: la fotocopia es valida."));
+
+      if (mode.runAudit) {
+        log.info(pc.dim("Auditoria semantica: pendiente de conectar al LLM (sin llamada simulada)."));
+      }
+
+      if (mode.runShadow) {
+        log.warn(
+          pc.yellow("Modo shadow: los cambios solo existen en la fotocopia. " + pc.bold("NO se consolidaron en el disco real."))
+        );
+
+        const consolidate = handleCancel(
+          await confirm({
+            message: "Consolidar los cambios de la fotocopia al disco real?",
+            active: "Consolidar",
+            inactive: "Descartar (rollback)",
+          })
+        );
+
+        if (consolidate) {
+          await mergeChanges(ws, "D-Engine: cambios consolidados");
+        } else {
+          log.info(pc.dim("Fotocopia descartada. Nada se consolido."));
+        }
       } else {
-        log.info(pc.dim("Sin cambios que consolidar en la fotocopia."));
+        await mergeChanges(ws, "D-Engine: cambios consolidados en modo fast");
       }
     }
 
@@ -193,6 +224,13 @@ async function main(): Promise<void> {
       await destroyShadow(s, ws);
       log.info(pc.dim("Fotocopia y rama temporal eliminadas."));
     }
+  }
+
+  try {
+    const head = await ws.headLog();
+    log.info(pc.dim("git log -1: ") + pc.white(head));
+  } catch (error) {
+    log.warn("No se pudo leer git log -1: " + (error instanceof Error ? error.message : String(error)));
   }
 
   process.exit(0);

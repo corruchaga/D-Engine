@@ -1,20 +1,40 @@
 import { execa } from "execa";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 interface GitOptions {
   cwd?: string;
+  allowFail?: boolean;
+}
+
+function gitLog(message: string): void {
+  console.log(`[d-engine:git] ${message}`);
 }
 
 async function runGit(args: string[], action: string, options: GitOptions = {}): Promise<string> {
+  const cwd = options.cwd ?? process.cwd();
+  gitLog(`${action}`);
+  gitLog(`  cwd: ${cwd}`);
+  gitLog(`  $ git ${args.join(" ")}`);
   try {
-    const { stdout } = await execa("git", args, options);
-    return stdout;
+    const result = await execa("git", args, { cwd });
+    const stdout = result.stdout.trim();
+    const stderr = result.stderr.trim();
+    gitLog(stdout.length > 0 ? `  ok stdout:\n${stdout}` : "  ok (sin stdout)");
+    if (stderr.length > 0) gitLog(`  stderr:\n${stderr}`);
+    return result.stdout;
   } catch (error) {
     const stderr = (error as { stderr?: string }).stderr?.trim();
+    const stdout = (error as { stdout?: string }).stdout?.trim();
     const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`git no pudo ${action}: ${stderr || detail}`);
+    const info = stderr || stdout || detail;
+    gitLog(`  FAIL: ${info}`);
+    if (options.allowFail) {
+      gitLog("  (ignorado: destroy/guard idempotente)");
+      return "";
+    }
+    throw new Error(`git no pudo ${action}: ${info}`);
   }
 }
 
@@ -22,6 +42,7 @@ export class ShadowWorkspace {
   private branch = "";
   private worktreePath = "";
   private originalBranch = "";
+  private repoRoot = "";
 
   get path(): string {
     return this.worktreePath;
@@ -39,41 +60,106 @@ export class ShadowWorkspace {
     const stamp = Date.now();
     this.branch = `shadow-${stamp}`;
     this.worktreePath = path.join(os.tmpdir(), `d-engine-${stamp}`);
+    this.repoRoot = process.cwd();
 
-    const current = await runGit(["branch", "--show-current"], "detectar la rama actual");
+    const current = await runGit(["branch", "--show-current"], "detectar la rama actual", {
+      cwd: this.repoRoot,
+    });
     this.originalBranch = current.trim();
 
     await runGit(
       ["worktree", "add", "-b", this.branch, this.worktreePath],
-      "crear la fotocopia"
+      "crear la fotocopia",
+      { cwd: this.repoRoot }
     );
 
     return this.worktreePath;
   }
 
   async destroy(): Promise<void> {
-    await runGit(
-      ["worktree", "remove", "--force", this.worktreePath],
-      "borrar la fotocopia"
-    );
-    await runGit(["branch", "-D", this.branch], "borrar la rama temporal");
+    const root = this.repoRoot || process.cwd();
+
+    if (this.worktreePath) {
+      await runGit(
+        ["worktree", "remove", "--force", this.worktreePath],
+        "borrar worktree (primero)",
+        { cwd: root, allowFail: true }
+      );
+    }
+
+    await runGit(["worktree", "prune"], "purgar worktrees huerfanos", {
+      cwd: root,
+      allowFail: true,
+    });
+
+    if (this.branch) {
+      await runGit(["branch", "-D", this.branch], "borrar rama temporal (despues)", {
+        cwd: root,
+        allowFail: true,
+      });
+    }
   }
 
   async commitAndMerge(message: string): Promise<boolean> {
-    const status = await runGit(["status", "--porcelain"], "comprobar cambios pendientes", {
-      cwd: this.worktreePath,
-    });
+    const photocopy = this.worktreePath;
+    const root = this.repoRoot || process.cwd();
 
-    if (status.trim().length === 0) {
+    gitLog(`commitAndMerge: fotocopia=${photocopy}`);
+    gitLog(`commitAndMerge: repo principal=${root} rama=${this.originalBranch || "(desconocida)"}`);
+
+    const porcelain = await runGit(["status", "--porcelain", "-uall"], "status en la FOTOCOPIA (no en master)", {
+      cwd: photocopy,
+    });
+    gitLog(`guard porcelain (fotocopia):\n${porcelain.trim() || "(vacio)"}`);
+
+    await runGit(["add", "-A"], "git add -A en la FOTOCOPIA", { cwd: photocopy });
+
+    const staged = await runGit(["diff", "--cached", "--name-only"], "archivos staged en la FOTOCOPIA", {
+      cwd: photocopy,
+    });
+    gitLog(`guard staged (fotocopia):\n${staged.trim() || "(vacio)"}`);
+
+    if (staged.trim().length === 0) {
+      gitLog("sin cambios que consolidar: la fotocopia no tiene diff staged");
       return false;
     }
 
-    await runGit(["add", "-A"], "preparar los cambios", { cwd: this.worktreePath });
-    await runGit(["commit", "-m", message], "hacer commit en la fotocopia", {
-      cwd: this.worktreePath,
+    await runGit(["commit", "-m", message], "commit en la FOTOCOPIA (rama shadow)", {
+      cwd: photocopy,
     });
-    await runGit(["merge", this.branch], "fusionar en la rama original");
+
+    const incoming = await runGit(
+      ["diff", "--name-only", "HEAD", this.branch],
+      "archivos que la fotocopia trae a master",
+      { cwd: root }
+    );
+
+    for (const rel of incoming.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) {
+      const track = await runGit(["status", "--porcelain", "--", rel], `estado de ${rel} en el repo principal`, {
+        cwd: root,
+        allowFail: true,
+      });
+      if (track.trim().startsWith("??")) {
+        const abs = path.join(root, rel);
+        if (existsSync(abs)) {
+          unlinkSync(abs);
+          gitLog(`quitado untracked que bloqueaba el merge: ${rel}`);
+        }
+      }
+    }
+
+    await runGit(
+      ["merge", "--no-edit", this.branch],
+      `merge ${this.branch} -> ${this.originalBranch || "rama actual"} (repo principal)`,
+      { cwd: root }
+    );
+
     return true;
+  }
+
+  async headLog(): Promise<string> {
+    const root = this.repoRoot || process.cwd();
+    return (await runGit(["log", "-1", "--oneline"], "git log -1 (master/HEAD)", { cwd: root })).trim();
   }
 }
 
@@ -335,5 +421,46 @@ export class LocalEditor {
 
     writeFileSync(abs, applied.content, "utf8");
     return { filePath: block.filePath, strategy: applied.strategy };
+  }
+}
+
+export interface ValidatorOptions {
+  command?: string;
+}
+
+export interface ValidatorResult {
+  ok: boolean;
+  output: string;
+}
+
+export class Validator {
+  static async run(cwd: string, options: ValidatorOptions = {}): Promise<ValidatorResult> {
+    const command = options.command ?? "tsc --noEmit";
+    const tokens = command.trim().split(/\s+/).filter((part) => part.length > 0);
+    const bin = tokens[0];
+    if (!bin) {
+      return { ok: false, output: "No se indico ningun comando de verificacion." };
+    }
+    const args = tokens.slice(1);
+
+    try {
+      const result = await execa(bin, args, {
+        cwd,
+        reject: false,
+        all: true,
+        preferLocal: true,
+        localDir: process.cwd(),
+      });
+      const output = (result.all ?? `${result.stdout}\n${result.stderr}`).trim();
+      if (result.exitCode === 0) {
+        return { ok: true, output };
+      }
+      return { ok: false, output };
+    } catch (error) {
+      const stderr = (error as { stderr?: string }).stderr?.trim();
+      const stdout = (error as { stdout?: string }).stdout?.trim();
+      const detail = error instanceof Error ? error.message : String(error);
+      return { ok: false, output: stderr || stdout || detail };
+    }
   }
 }
