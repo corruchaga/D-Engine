@@ -18,5 +18,6 @@
     "verbatimModuleSyntax": true,
     "skipLibCheck": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["src/test-p3.ts", "src/test-p9.ts"]
 }

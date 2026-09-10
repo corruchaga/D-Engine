@@ -18,3 +18,5 @@
 
 8\. Toda ejecución limpia su fotocopia y rama temporal, falle o consolide.
 
+9\. Enter vacío en archivo objetivo lanza un selector barato; el usuario confirma o edita; el editor nunca elige solo.
+

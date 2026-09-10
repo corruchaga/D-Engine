@@ -4,7 +4,9 @@ import { copyFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
 import path from "node:path";
 import pc from "picocolors";
 import { LLMParser, LocalEditor, ShadowWorkspace, Validator, type EditBlock } from "./engine.js";
-import { parseVerifyVerdict, proposeChanges, proposeCorrection, verifyChanges } from "./llm.js";
+import { buildSelectorCatalog } from "./context.js";
+import { parseVerifyVerdict, proposeChanges, proposeCorrection, selectTargetFiles, verifyChanges } from "./llm.js";
+import { normalizeRel, resolveSelectorPaths } from "./selector.js";
 
 type SecurityMode = "fast" | "verify" | "shadow";
 
@@ -45,6 +47,21 @@ const MODES: Record<SecurityMode, ModeConfig> = {
 };
 
 const DEFAULT_TARGET = "src/demo/calculator.ts";
+
+const llmCalls = { selector: 0, proposal: 0, audit: 0 };
+
+function llmTotal(): number {
+  return llmCalls.selector + llmCalls.proposal + llmCalls.audit;
+}
+
+function llmSummary(): string {
+  const parts: string[] = [];
+  if (llmCalls.selector > 0) parts.push(`selector ${llmCalls.selector}`);
+  if (llmCalls.proposal > 0) parts.push(`propuesta ${llmCalls.proposal}`);
+  if (llmCalls.audit > 0) parts.push(`auditoria ${llmCalls.audit}`);
+  const detail = parts.length > 0 ? ` (${parts.join(" + ")})` : "";
+  return `Llamadas LLM: ${llmTotal()}${detail}`;
+}
 
 function handleCancel<T>(value: T | symbol): T {
   if (isCancel(value)) {
@@ -91,25 +108,111 @@ function ensureDemoFile(worktreePath: string, rel: string): void {
   copyFileSync(src, dest);
 }
 
-function normalizeRel(rel: string): string {
-  return rel.replaceAll("\\", "/").replace(/^\.\//, "");
-}
-
 function withNormalizedPaths(blocks: EditBlock[]): EditBlock[] {
   return blocks.map((block) => ({ ...block, filePath: normalizeRel(block.filePath) }));
 }
 
 function parseTargets(value: string): string[] {
-  const raw = value.trim() || DEFAULT_TARGET;
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const part of raw.split(",")) {
+  for (const part of value.split(",")) {
     const rel = normalizeRel(part.trim());
     if (!rel || seen.has(rel)) continue;
     seen.add(rel);
     out.push(rel);
   }
-  return out.length > 0 ? out : [DEFAULT_TARGET];
+  return out;
+}
+
+function validateTargetInput(value: string): string | undefined {
+  const rels = parseTargets(value);
+  if (rels.length === 0) return "Indica al menos un archivo.";
+  const missing = rels.filter((rel) => !existsSync(path.resolve(process.cwd(), rel)));
+  if (missing.length > 0) return `El archivo no existe en el repo: ${missing.join(", ")}`;
+}
+
+async function askManualTargets(prefill?: string): Promise<string[]> {
+  const targetRaw = handleCancel(
+    await text({
+      message: "¿Archivo objetivo?",
+      placeholder: DEFAULT_TARGET,
+      defaultValue: prefill && prefill.length > 0 ? prefill : DEFAULT_TARGET,
+      validate: (value) => validateTargetInput(value ?? ""),
+    })
+  );
+  return parseTargets(String(targetRaw));
+}
+
+async function resolveTargetFiles(promptText: string): Promise<string[]> {
+  const targetRaw = handleCancel(
+    await text({
+      message: "¿Archivo objetivo? (Enter vacio = seleccion automatica)",
+      placeholder: "vacio = auto  ·  src/foo.ts, src/bar.ts",
+      validate: (value) => {
+        const v = (value ?? "").trim();
+        if (v.length === 0) return;
+        return validateTargetInput(v);
+      },
+    })
+  );
+  const typed = String(targetRaw).trim();
+  if (typed.length > 0) return parseTargets(typed);
+
+  const spin = spinner();
+  spin.start("Seleccionando archivos objetivo...");
+  let catalog: { text: string; candidates: string[] };
+  try {
+    catalog = await buildSelectorCatalog(promptText);
+  } catch {
+    spin.stop();
+    log.warn("No se pudo construir el catalogo. Elige archivos a mano.");
+    return askManualTargets();
+  }
+  if (catalog.candidates.length === 0) {
+    spin.stop();
+    log.warn("No hay archivos candidatos. Elige archivos a mano.");
+    return askManualTargets();
+  }
+
+  try {
+    let result = await selectTargetFiles(promptText, catalog.text);
+    llmCalls.selector += 1;
+    let resolved = resolveSelectorPaths(result.text, catalog.candidates);
+    if (!resolved.ok) {
+      log.warn(`Selector: ${resolved.reason}. Reintentando una vez...`);
+      const feedback =
+        resolved.reason === "formato invalido"
+          ? "formato invalido; responde solo un JSON array de rutas del catalogo"
+          : `${resolved.reason}; responde solo un JSON array de rutas del catalogo`;
+      result = await selectTargetFiles(promptText, catalog.text, {
+        previousText: result.text,
+        feedback,
+      });
+      llmCalls.selector += 1;
+      resolved = resolveSelectorPaths(result.text, catalog.candidates);
+    }
+    spin.stop();
+    if (!resolved.ok) {
+      log.warn("El selector no devolvio rutas validas. Elige archivos a mano.");
+      return askManualTargets();
+    }
+    log.info(pc.dim("Seleccion automatica: ") + pc.cyan(resolved.paths.join(", ")));
+    const choice = handleCancel(
+      await select({
+        message: "¿Usar estos archivos?",
+        options: [
+          { value: "yes", label: "si" },
+          { value: "edit", label: "editar manualmente" },
+        ],
+      })
+    );
+    if (choice === "edit") return askManualTargets(resolved.paths.join(", "));
+    return resolved.paths;
+  } catch {
+    spin.stop();
+    log.warn("El selector fallo. Elige archivos a mano.");
+    return askManualTargets();
+  }
 }
 
 function unauthorizedBlockPaths(blocks: EditBlock[], targets: string[]): string[] {
@@ -141,19 +244,7 @@ async function main(): Promise<void> {
     })
   );
 
-  const targetRaw = handleCancel(
-    await text({
-      message: "¿Archivo objetivo?",
-      placeholder: DEFAULT_TARGET,
-      defaultValue: DEFAULT_TARGET,
-      validate: (value) => {
-        const rels = parseTargets(value ?? "");
-        const missing = rels.filter((rel) => !existsSync(path.resolve(process.cwd(), rel)));
-        if (missing.length > 0) return `El archivo no existe en el repo: ${missing.join(", ")}`;
-      },
-    })
-  );
-  const targetRels = parseTargets(String(targetRaw));
+  const targetRels = await resolveTargetFiles(promptText);
 
   const modeRaw = handleCancel(
     await select({
@@ -176,6 +267,7 @@ async function main(): Promise<void> {
   );
 
   if (!shouldRun) {
+    if (llmTotal() > 0) log.info(pc.dim(llmSummary()));
     cancel("Operacion cancelada.");
     process.exit(0);
   }
@@ -198,12 +290,14 @@ async function main(): Promise<void> {
 
     s.start("Llamando al LLM para proponer SEARCH/REPLACE...");
     let proposal = await proposeChanges(promptText, targetRels);
+    llmCalls.proposal += 1;
     let blocks;
     try {
       blocks = LLMParser.parse(proposal.text);
     } catch {
       log.warn("La respuesta no tenia bloques validos. Reintentando una vez...");
       proposal = await proposeCorrection(promptText, targetRels, proposal.text);
+      llmCalls.proposal += 1;
       try {
         blocks = LLMParser.parse(proposal.text);
       } catch {
@@ -222,6 +316,7 @@ async function main(): Promise<void> {
       const pathCorrection =
         `los archivos a modificar son exactamente ${allowed}; tu bloque apuntaba a ${wrong}; responde solo con bloques corregidos`;
       proposal = await proposeCorrection(promptText, targetRels, proposal.text, pathCorrection);
+      llmCalls.proposal += 1;
       try {
         blocks = withNormalizedPaths(LLMParser.parse(proposal.text));
       } catch {
@@ -265,6 +360,7 @@ async function main(): Promise<void> {
       ].join("\n");
       s.start("Llamando al LLM para corregir errores de compilacion...");
       proposal = await proposeCorrection(promptText, targetRels, proposal.text, compileFeedback);
+      llmCalls.proposal += 1;
       try {
         blocks = withNormalizedPaths(LLMParser.parse(proposal.text));
       } catch {
@@ -304,6 +400,7 @@ async function main(): Promise<void> {
         s.start("Auditoria semantica (2da llamada LLM)...");
         const diff = await ws.diffHead();
         const audit = await verifyChanges(promptText, diff);
+        llmCalls.audit += 1;
         s.stop();
         const verdict = parseVerifyVerdict(audit.text);
         if (verdict.ok) {
@@ -355,6 +452,7 @@ async function main(): Promise<void> {
       }
     }
 
+    log.info(pc.dim(llmSummary()));
     outro(pc.cyan("D-Engine") + pc.dim(" finalizado."));
   } finally {
     if (shadowCreated) {
@@ -374,6 +472,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
+  if (llmTotal() > 0) log.info(pc.dim(llmSummary()));
   cancel(pc.red("Error inesperado: ") + (err instanceof Error ? err.message : String(err)));
   process.exit(1);
 });

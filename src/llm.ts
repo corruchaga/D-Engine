@@ -54,16 +54,25 @@ function chatUrl(base: string): string {
   return `${trimmed}/chat/completions`;
 }
 
-function llmLog(tokensIn: number, tokensOut: number): void {
+function llmLog(tokensIn: number, tokensOut: number, label?: string): void {
   const total = tokensIn + tokensOut;
-  console.log(`[d-engine:llm] prompt=${tokensIn} completion=${tokensOut} total=${total}`);
+  const tag = label ? ` ${label}` : "";
+  console.log(`[d-engine:llm]${tag} prompt=${tokensIn} completion=${tokensOut} total=${total}`);
 }
 
-async function chatCompletions(messages: ChatMessage[]): Promise<ProposeResult> {
+interface ChatOptions {
+  label?: string;
+  maxTokens?: number;
+}
+
+async function chatCompletions(messages: ChatMessage[], options: ChatOptions = {}): Promise<ProposeResult> {
   const base = env("LLM_BASE_URL");
   const apiKey = env("LLM_API_KEY");
   const model = env("LLM_MODEL");
   const url = chatUrl(base);
+
+  const payload: { model: string; messages: ChatMessage[]; max_tokens?: number } = { model, messages };
+  if (options.maxTokens !== undefined) payload.max_tokens = options.maxTokens;
 
   let response: Response;
   try {
@@ -73,7 +82,7 @@ async function chatCompletions(messages: ChatMessage[]): Promise<ProposeResult> 
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model, messages }),
+      body: JSON.stringify(payload),
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -98,8 +107,31 @@ async function chatCompletions(messages: ChatMessage[]): Promise<ProposeResult> 
   const text = data.choices?.[0]?.message?.content ?? "";
   const tokensIn = data.usage?.prompt_tokens ?? 0;
   const tokensOut = data.usage?.completion_tokens ?? 0;
-  llmLog(tokensIn, tokensOut);
+  if (options.label !== undefined) llmLog(tokensIn, tokensOut, options.label);
+  else llmLog(tokensIn, tokensOut);
   return { text, tokensIn, tokensOut };
+}
+
+const SELECTOR_SYSTEM = `Eres un selector de archivos. Responde UNICAMENTE un JSON array de strings con rutas posix del catalogo. Ejemplo: ["src/engine.ts"]. Prohibido markdown, explicaciones o rutas fuera de la lista.`;
+
+function selectorUser(prompt: string, catalogText: string): string {
+  return [`Prompt del usuario:`, prompt, ``, `Catalogo:`, catalogText].join("\n");
+}
+
+export async function selectTargetFiles(
+  prompt: string,
+  catalogText: string,
+  retry?: { previousText: string; feedback: string }
+): Promise<ProposeResult> {
+  const messages: ChatMessage[] = [
+    { role: "system", content: SELECTOR_SYSTEM },
+    { role: "user", content: selectorUser(prompt, catalogText) },
+  ];
+  if (retry) {
+    messages.push({ role: "assistant", content: retry.previousText });
+    messages.push({ role: "user", content: retry.feedback });
+  }
+  return chatCompletions(messages, { label: "selector", maxTokens: 200 });
 }
 
 function userMessage(prompt: string, filePaths: string[], context: string): string {
