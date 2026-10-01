@@ -87,6 +87,6 @@ The TUI asks for: change description, target file (empty Enter = automatic selec
 - Mandatory Verify when a patch applied via fuzzy
 - Time and tokens in the final summary
 
-## License
-
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)]
+(LICENSE)
 MIT. Copyright (c) 2026 Sergi Corruchaga.
