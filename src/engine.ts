@@ -200,7 +200,7 @@ export class ShadowWorkspace {
     }
   }
 
-  async commitAndMerge(message: string, files: string[]): Promise<boolean> {
+  async commitAndMerge(message: string, files: string[]): Promise<MergeOutcome> {
     const photocopy = this.worktreePath;
     const root = this.repoRoot || process.cwd();
     const allowed = [...new Set(files.map(normalizeRepoPath).filter(Boolean))];
@@ -224,7 +224,7 @@ export class ShadowWorkspace {
 
     if (allowed.length === 0) {
       gitLog("sin cambios que consolidar: no hay archivos del parche");
-      return false;
+      return emptyMergeOutcome();
     }
 
     await runGit(["add", "--", ...allowed], "git add -- archivos del parche en la FOTOCOPIA", {
@@ -248,20 +248,22 @@ export class ShadowWorkspace {
 
     if (stagedFiles.length === 0) {
       gitLog("sin cambios que consolidar: la fotocopia no tiene diff staged");
-      return false;
+      return emptyMergeOutcome();
     }
 
     await runGit(["commit", "-m", message], "commit en la FOTOCOPIA (rama shadow)", {
       cwd: photocopy,
     });
 
-    const incoming = await runGit(
-      ["diff", "--name-only", "HEAD", this.branch],
+    const incomingRaw = await runGit(
+      ["diff", "--name-status", "--no-renames", "HEAD", this.branch],
       "archivos que la fotocopia trae a master",
       { cwd: root }
     );
+    const incoming = parseNameStatus(incomingRaw);
 
-    for (const rel of incoming.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)) {
+    for (const entry of incoming) {
+      const rel = entry.path;
       const track = await runGit(["status", "--porcelain", "--", rel], `estado de ${rel} en el repo principal`, {
         cwd: root,
         allowFail: true,
@@ -281,7 +283,13 @@ export class ShadowWorkspace {
       { cwd: root }
     );
 
-    return true;
+    const created: string[] = [];
+    const edited: string[] = [];
+    for (const entry of incoming) {
+      if (entry.status === "A") created.push(entry.path);
+      else edited.push(entry.path);
+    }
+    return { merged: true, created, edited };
   }
 
   async headLog(): Promise<string> {
@@ -344,6 +352,39 @@ export type ApplyStrategy =
 export interface ApplyResult {
   filePath: string;
   strategy: ApplyStrategy;
+}
+
+export function hasFuzzyPatch(applied: ApplyResult[]): boolean {
+  return applied.some((result) => result.strategy === "fuzzy");
+}
+
+export interface MergeOutcome {
+  merged: boolean;
+  created: string[];
+  edited: string[];
+}
+
+export function emptyMergeOutcome(): MergeOutcome {
+  return { merged: false, created: [], edited: [] };
+}
+
+export interface NameStatusEntry {
+  status: string;
+  path: string;
+}
+
+export function parseNameStatus(output: string): NameStatusEntry[] {
+  const entries: NameStatusEntry[] = [];
+  for (const rawLine of output.split(/\r?\n/)) {
+    if (rawLine.trim().length === 0) continue;
+    const tab = rawLine.indexOf("\t");
+    if (tab === -1) continue;
+    const status = rawLine.slice(0, tab).trim().charAt(0).toUpperCase();
+    const path = normalizeRepoPath(rawLine.slice(tab + 1).trim());
+    if (!status || !path) continue;
+    entries.push({ status, path });
+  }
+  return entries;
 }
 
 const FUZZY_THRESHOLD = 0.85;

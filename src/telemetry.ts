@@ -5,11 +5,12 @@ export interface PhaseTimings {
   proposalMs: number[];
   gateMs: number[];
   tscMs: number[];
+  auditMs: number[];
   mergeMs: number;
 }
 
 export function createPhaseTimings(): PhaseTimings {
-  return { selectionMs: 0, proposalMs: [], gateMs: [], tscMs: [], mergeMs: 0 };
+  return { selectionMs: 0, proposalMs: [], gateMs: [], tscMs: [], auditMs: [], mergeMs: 0 };
 }
 
 export function resolveAgentTokenEstimate(raw?: string): number {
@@ -52,8 +53,12 @@ export function timingLines(timings: PhaseTimings, sessionMs: number): string[] 
     const proposal = formatSeconds(timings.proposalMs[i] ?? 0);
     const gate = formatSeconds(timings.gateMs[i] ?? 0);
     const tsc = timings.tscMs[i] ?? 0;
-    const tscPart = tsc > 0 ? ` (tsc ${formatSeconds(tsc)})` : "";
-    lines.push(`Intento ${i + 1} - proposer: ${proposal} - puerta: ${gate}${tscPart}`);
+    const audit = timings.auditMs[i] ?? 0;
+    const details: string[] = [];
+    if (tsc > 0) details.push(`tsc ${formatSeconds(tsc)}`);
+    if (audit > 0) details.push(`audit ${formatSeconds(audit)}`);
+    const detailPart = details.length > 0 ? ` (${details.join(", ")})` : "";
+    lines.push(`Intento ${i + 1} - proposer: ${proposal} - puerta: ${gate}${detailPart}`);
   }
   lines.push(`Merge: ${formatSeconds(timings.mergeMs)}`);
   lines.push(`TOTAL sesion: ${formatSeconds(sessionMs)}`);

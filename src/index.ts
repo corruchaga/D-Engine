@@ -10,7 +10,10 @@ import {
   PorcelainGuardError,
   ShadowWorkspace,
   Validator,
+  emptyMergeOutcome,
+  hasFuzzyPatch,
   type ApplyResult,
+  type MergeOutcome,
   type ParsedBlock,
 } from "./engine.js";
 import { buildSelectorCatalog } from "./context.js";
@@ -25,6 +28,7 @@ import {
   attemptLines,
   formatLlmCalls,
   llmTotal,
+  resolveFuzzyVerify,
   resolveMaxRetries,
   runBoundedRetry,
   sumTokens,
@@ -297,14 +301,15 @@ interface GatedChange {
   applied: ApplyResult[];
 }
 
-async function mergeChanges(ws: ShadowWorkspace, message: string, files: string[]): Promise<void> {
+async function mergeChanges(ws: ShadowWorkspace, message: string, files: string[]): Promise<MergeOutcome> {
   try {
-    const merged = await ws.commitAndMerge(message, files);
-    if (merged) {
+    const outcome = await ws.commitAndMerge(message, files);
+    if (outcome.merged) {
       log.success(pc.green("Cambios consolidados en la rama real."));
     } else {
       log.info(pc.dim("Sin cambios que consolidar en la fotocopia."));
     }
+    return outcome;
   } catch (error) {
     if (error instanceof PorcelainGuardError) {
       log.error(
@@ -312,7 +317,7 @@ async function mergeChanges(ws: ShadowWorkspace, message: string, files: string[
           `La puerta rechazo el cambio: se detectaron modificaciones fuera de los archivos del parche: ${error.files.join(", ")}. Nada se consolida.`
         )
       );
-      return;
+      return emptyMergeOutcome();
     }
     throw error;
   }
@@ -363,11 +368,17 @@ async function main(): Promise<void> {
   }
 
   const maxRetries = resolveMaxRetries(process.env.D_ENGINE_MAX_RETRIES);
+  const fuzzyVerifyOn = resolveFuzzyVerify(process.env.D_ENGINE_FUZZY_VERIFY);
 
   log.info(pc.dim("Prompt recibido: ") + pc.white(promptText));
   log.info(pc.dim("Modo de seguridad: ") + pc.magenta(mode.label) + pc.dim(`  (${mode.llmCalls} llamada(s) LLM)`));
   log.info(pc.dim("Archivos objetivo: ") + formatTargets(targetRels));
   log.info(pc.dim("Reintentos max: ") + pc.white(String(maxRetries)) + pc.dim(" (D_ENGINE_MAX_RETRIES)"));
+  log.info(
+    pc.dim("Auto-auditoria fuzzy: ") +
+      (fuzzyVerifyOn ? pc.white("ON") : pc.white("OFF")) +
+      pc.dim(" (D_ENGINE_FUZZY_VERIFY)")
+  );
 
   const s = spinner();
   const ws = new ShadowWorkspace();
@@ -441,28 +452,92 @@ async function main(): Promise<void> {
       return { result: { ok: true, value: { applied } }, tscMs };
     };
 
+    let fuzzyAuditUnavailable = 0;
+    let mergeOutcome: MergeOutcome = emptyMergeOutcome();
+
     const gate = async (proposal: RetryProposal, attemptIndex: number): Promise<GateResult<GatedChange>> => {
+      const attemptStart = performance.now();
       s.start(`Intento ${attemptIndex}: materializando y compilando (tsc)...`);
-      const gateStart = performance.now();
       const evaluated = await evaluateGate(proposal).finally(() => s.stop());
-      const gateMs = performance.now() - gateStart;
-      timings.gateMs.push(gateMs);
       timings.tscMs.push(evaluated.tscMs);
       const tokens = proposal.tokensIn + proposal.tokensOut;
-      if (evaluated.result.ok) {
-        log.success(
-          pc.green(`Intento ${attemptIndex}: puerta OK (tsc en verde) - ${tokens} tok - ${formatSeconds(gateMs)}`)
-        );
-      } else {
+
+      if (!evaluated.result.ok) {
         const rejection = evaluated.result.rejection;
+        const gateMs = performance.now() - attemptStart;
+        timings.gateMs.push(gateMs);
+        timings.auditMs.push(0);
         log.error(
           pc.red(`Intento ${attemptIndex} rechazado [${rejection.kind}] - ${tokens} tok - ${formatSeconds(gateMs)}`)
         );
         for (const line of firstLines(rejection.output ?? rejection.reason)) {
           log.info(pc.dim(`  ${line}`));
         }
+        return evaluated.result;
       }
-      return evaluated.result;
+
+      const okResult = evaluated.result;
+      log.success(
+        pc.green(
+          `Intento ${attemptIndex}: puerta OK (tsc en verde) - ${tokens} tok - ${formatSeconds(performance.now() - attemptStart)}`
+        )
+      );
+
+      let result: GateResult<GatedChange> = okResult;
+      if (fuzzyVerifyOn && !mode.runAudit && hasFuzzyPatch(okResult.value.applied)) {
+        log.info(pc.yellow("Parche aplicado por fuzzy -> auditoria semantica automatica"));
+        s.start(`Intento ${attemptIndex}: auditoria semantica automatica...`);
+        const auditStart = performance.now();
+        let audit: RetryProposal | null = null;
+        let auditError = "";
+        try {
+          const diff = await ws.diffHead([...new Set(okResult.value.applied.map((r) => r.filePath))]);
+          audit = await verifyChanges(promptText, diff);
+        } catch (error) {
+          auditError = error instanceof Error ? error.message : String(error);
+        }
+        const auditMs = performance.now() - auditStart;
+        timings.auditMs.push(auditMs);
+        timings.gateMs.push(performance.now() - attemptStart);
+        s.stop();
+
+        if (audit === null) {
+          fuzzyAuditUnavailable = okResult.value.applied.filter((r) => r.strategy === "fuzzy").length;
+          log.warn(pc.yellow("Auditoria no disponible (error de red) - el parche fuzzy sigue sin auditar"));
+          log.info(pc.dim(`  ${auditError}`));
+          return result;
+        }
+
+        llmCalls.audit += 1;
+        llmTokens.audit += audit.tokensIn + audit.tokensOut;
+        const verdict = parseVerifyVerdict(audit.text);
+        if (verdict.ok) {
+          if (verdict.reason) {
+            log.success(pc.green("Auditoria automatica OK_CON_OBSERVACIONES: ") + verdict.reason);
+          } else {
+            log.success(pc.green("Auditoria automatica OK: el diff cumple el requisito."));
+          }
+          return result;
+        }
+
+        result = { ok: false, rejection: { kind: "audit", reason: verdict.reason || audit.text.trim() } };
+        log.error(pc.red("Auditoria automatica FALLO: ") + result.rejection.reason);
+        log.error(
+          pc.red(
+            `Intento ${attemptIndex} rechazado [${result.rejection.kind}] - ${tokens} tok - ${formatSeconds(
+              performance.now() - attemptStart
+            )}`
+          )
+        );
+        for (const line of firstLines(result.rejection.reason)) {
+          log.info(pc.dim(`  ${line}`));
+        }
+        return result;
+      }
+
+      timings.auditMs.push(0);
+      timings.gateMs.push(performance.now() - attemptStart);
+      return result;
     };
 
     let proposalIndex = 0;
@@ -545,7 +620,7 @@ async function main(): Promise<void> {
 
         if (consolidate) {
           const mergeStart = performance.now();
-          await mergeChanges(ws, "D-Engine: cambios consolidados en modo shadow", [
+          mergeOutcome = await mergeChanges(ws, "D-Engine: cambios consolidados en modo shadow", [
             ...new Set(applied.map((result) => result.filePath)),
           ]);
           timings.mergeMs += performance.now() - mergeStart;
@@ -556,7 +631,7 @@ async function main(): Promise<void> {
         }
       } else {
         const mergeStart = performance.now();
-        await mergeChanges(
+        mergeOutcome = await mergeChanges(
           ws,
           mode.runAudit ? "D-Engine: cambios consolidados en modo verify" : "D-Engine: cambios consolidados en modo fast",
           [...new Set(applied.map((result) => result.filePath))]
@@ -565,8 +640,8 @@ async function main(): Promise<void> {
       }
     }
 
-    const created = applied.filter((result) => result.strategy === "new-file").length;
-    const edited = applied.length - created;
+    const created = mergeOutcome.created.length;
+    const edited = mergeOutcome.edited.length;
     const attemptTokens = sumTokens(outcome.attempts);
     const runTokens = attemptTokens.total + llmTokens.selector + llmTokens.audit;
     const sessionMs = performance.now() - sessionStart;
@@ -574,6 +649,13 @@ async function main(): Promise<void> {
     log.info(pc.dim("Resultado: ") + pc.white(`${created} archivo(s) creado(s)`) + pc.dim(" · ") + pc.white(`${edited} editado(s)`));
     log.info(pc.dim("Tokens del run: ") + pc.white(tokenSummary(attemptTokens.total)));
     log.info(pc.dim(formatLlmCalls(llmCalls)));
+    if (mergeOutcome.merged && fuzzyAuditUnavailable > 0) {
+      log.warn(
+        pc.yellow(
+          `${fuzzyAuditUnavailable} parche(s) fuzzy consolidado(s) SIN auditoria (auditoria no disponible)`
+        )
+      );
+    }
     log.info(pc.bold("Tiempos por fase:"));
     for (const line of timingLines(timings, sessionMs)) {
       log.info(pc.dim(`  ${line}`));

@@ -3,7 +3,7 @@ export const ABSOLUTE_MAX_RETRIES = 5;
 export const TSC_OUTPUT_MAX_LINES = 60;
 export const TSC_OUTPUT_MAX_CHARS = 4000;
 
-export type RejectionKind = "format" | "path" | "materialization" | "compile";
+export type RejectionKind = "format" | "path" | "materialization" | "compile" | "audit";
 
 export interface GateRejection {
   kind: RejectionKind;
@@ -53,6 +53,12 @@ export function resolveMaxRetries(configured?: string | number): number {
   return Math.max(0, Math.min(ABSOLUTE_MAX_RETRIES, Math.trunc(base)));
 }
 
+export function resolveFuzzyVerify(configured?: string): boolean {
+  const raw = (configured ?? "").trim().toLowerCase();
+  if (raw.length === 0) return true;
+  return !["0", "false", "off", "no"].includes(raw);
+}
+
 export function truncateToolOutput(output: string): string {
   const lines = output.replace(/\r\n/g, "\n").split("\n");
   const errors = lines.filter((line) => /\berror\b/i.test(line));
@@ -95,6 +101,13 @@ export function buildGateFeedback(rejection: GateRejection): string {
       return [
         "tu respuesta no contenía bloques SEARCH/REPLACE ni NEW FILE válidos; responde solo con bloques.",
         rejection.reason,
+      ].join("\n");
+    case "audit":
+      return [
+        "la compilacion paso, pero la auditoria semantica automatica rechazo el resultado (se disparo porque tu parche solo se pudo aplicar por aproximacion fuzzy); tu intento anterior NO se consolido.",
+        "Motivo de la auditoria:",
+        truncateToolOutput(rejection.reason),
+        "Rehaz el parche con el texto EXACTO del archivo objetivo (SEARCH identico al archivo) y corrige lo senalado.",
       ].join("\n");
   }
 }
@@ -178,6 +191,8 @@ export function rejectionLabel(kind: RejectionKind): string {
       return "rechazado (no se pudo materializar)";
     case "compile":
       return "rechazado por la puerta (tsc)";
+    case "audit":
+      return "rechazado por la auditoria (semantica)";
   }
 }
 
