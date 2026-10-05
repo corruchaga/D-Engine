@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { intro, outro, text, select, confirm, spinner, log, cancel, isCancel } from "@clack/prompts";
 import { copyFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
+import { performance } from "node:perf_hooks";
 import path from "node:path";
 import pc from "picocolors";
 import {
@@ -32,6 +33,14 @@ import {
   type RetryProposal,
 } from "./retry.js";
 import { isSafeNewPath, normalizeRel, resolveSelectorPaths } from "./selector.js";
+import {
+  costComparisonLine,
+  createPhaseTimings,
+  firstLines,
+  formatSeconds,
+  resolveAgentTokenEstimate,
+  timingLines,
+} from "./telemetry.js";
 
 type SecurityMode = "fast" | "verify" | "shadow";
 
@@ -76,6 +85,8 @@ const DEFAULT_TARGET = "src/demo/calculator.ts";
 const llmCalls: LlmCalls = { selector: 0, proposal: 0, retries: 0, audit: 0 };
 
 const llmTokens = { selector: 0, audit: 0 };
+
+const timings = createPhaseTimings();
 
 function tokenSummary(attemptTokens: number): string {
   const parts = [`intentos ${attemptTokens}`];
@@ -208,17 +219,26 @@ async function resolveTargetFiles(promptText: string): Promise<string[]> {
   if (typed.length > 0) return parseTargets(typed);
 
   const spin = spinner();
+  const selectionStart = performance.now();
+  let selectionRecorded = false;
+  const recordSelection = (): void => {
+    if (selectionRecorded) return;
+    selectionRecorded = true;
+    timings.selectionMs += performance.now() - selectionStart;
+  };
   spin.start("Seleccionando archivos objetivo...");
   let catalog: { text: string; candidates: string[] };
   try {
     catalog = await buildSelectorCatalog(promptText);
   } catch {
     spin.stop();
+    recordSelection();
     log.warn("No se pudo construir el catalogo. Elige archivos a mano.");
     return askManualTargets();
   }
   if (catalog.candidates.length === 0) {
     spin.stop();
+    recordSelection();
     log.warn("No hay archivos candidatos. Elige archivos a mano.");
     return askManualTargets();
   }
@@ -243,6 +263,7 @@ async function resolveTargetFiles(promptText: string): Promise<string[]> {
       resolved = resolveSelectorPaths(result.text, catalog.candidates, { allowNew: true });
     }
     spin.stop();
+    recordSelection();
     if (!resolved.ok) {
       log.warn("El selector no devolvio rutas validas. Elige archivos a mano.");
       return askManualTargets();
@@ -261,6 +282,7 @@ async function resolveTargetFiles(promptText: string): Promise<string[]> {
     return resolved.paths;
   } catch {
     spin.stop();
+    recordSelection();
     log.warn("El selector fallo. Elige archivos a mano.");
     return askManualTargets();
   }
@@ -297,6 +319,7 @@ async function mergeChanges(ws: ShadowWorkspace, message: string, files: string[
 }
 
 async function main(): Promise<void> {
+  const sessionStart = performance.now();
   intro(pc.bold(pc.cyan("D-Engine")) + pc.dim("  — la IA piensa, la puerta decide."));
 
   const promptText = handleCancel(
@@ -357,25 +380,33 @@ async function main(): Promise<void> {
 
     linkNodeModules(worktreePath);
 
-    const gate = async (proposal: RetryProposal, _attemptIndex: number): Promise<GateResult<GatedChange>> => {
+    const evaluateGate = async (
+      proposal: RetryProposal
+    ): Promise<{ result: GateResult<GatedChange>; tscMs: number }> => {
       let blocks: ParsedBlock[];
       try {
         blocks = withNormalizedPaths(LLMParser.parse(proposal.text));
       } catch (error) {
         return {
-          ok: false,
-          rejection: { kind: "format", reason: error instanceof Error ? error.message : String(error) },
+          result: {
+            ok: false,
+            rejection: { kind: "format", reason: error instanceof Error ? error.message : String(error) },
+          },
+          tscMs: 0,
         };
       }
       const missing = unauthorizedBlockPaths(blocks, targetRels);
       if (missing.length > 0) {
         const wrong = missing[0] ?? "(desconocida)";
         return {
-          ok: false,
-          rejection: {
-            kind: "path",
-            reason: `el archivo del bloque no es un objetivo (apuntaba a ${wrong}; los objetivos son ${targetRels.join(", ")}).`,
+          result: {
+            ok: false,
+            rejection: {
+              kind: "path",
+              reason: `el archivo del bloque no es un objetivo (apuntaba a ${wrong}; los objetivos son ${targetRels.join(", ")}).`,
+            },
           },
+          tscMs: 0,
         };
       }
 
@@ -387,33 +418,72 @@ async function main(): Promise<void> {
         applied = blocks.map((block) => LocalEditor.apply(worktreePath, block));
       } catch (error) {
         return {
-          ok: false,
-          rejection: {
-            kind: "materialization",
-            reason: error instanceof Error ? error.message : String(error),
+          result: {
+            ok: false,
+            rejection: {
+              kind: "materialization",
+              reason: error instanceof Error ? error.message : String(error),
+            },
           },
+          tscMs: 0,
         };
       }
 
+      const tscStart = performance.now();
       const check = await Validator.run(worktreePath);
+      const tscMs = performance.now() - tscStart;
       if (!check.ok) {
-        return { ok: false, rejection: { kind: "compile", reason: check.output, output: check.output } };
+        return {
+          result: { ok: false, rejection: { kind: "compile", reason: check.output, output: check.output } },
+          tscMs,
+        };
       }
-      return { ok: true, value: { applied } };
+      return { result: { ok: true, value: { applied } }, tscMs };
     };
 
+    const gate = async (proposal: RetryProposal, attemptIndex: number): Promise<GateResult<GatedChange>> => {
+      s.start(`Intento ${attemptIndex}: materializando y compilando (tsc)...`);
+      const gateStart = performance.now();
+      const evaluated = await evaluateGate(proposal).finally(() => s.stop());
+      const gateMs = performance.now() - gateStart;
+      timings.gateMs.push(gateMs);
+      timings.tscMs.push(evaluated.tscMs);
+      const tokens = proposal.tokensIn + proposal.tokensOut;
+      if (evaluated.result.ok) {
+        log.success(
+          pc.green(`Intento ${attemptIndex}: puerta OK (tsc en verde) - ${tokens} tok - ${formatSeconds(gateMs)}`)
+        );
+      } else {
+        const rejection = evaluated.result.rejection;
+        log.error(
+          pc.red(`Intento ${attemptIndex} rechazado [${rejection.kind}] - ${tokens} tok - ${formatSeconds(gateMs)}`)
+        );
+        for (const line of firstLines(rejection.output ?? rejection.reason)) {
+          log.info(pc.dim(`  ${line}`));
+        }
+      }
+      return evaluated.result;
+    };
+
+    let proposalIndex = 0;
     const propose = async (feedback?: { previousText: string; message: string }) => {
-      if (feedback) {
-        llmCalls.retries += 1;
-        return proposeCorrection(promptText, targetRels, feedback.previousText, feedback.message);
+      proposalIndex += 1;
+      s.start(`Intento ${proposalIndex}: proponiendo${feedback ? " correccion" : ""}...`);
+      const proposeStart = performance.now();
+      try {
+        if (feedback) {
+          llmCalls.retries += 1;
+          return await proposeCorrection(promptText, targetRels, feedback.previousText, feedback.message);
+        }
+        llmCalls.proposal += 1;
+        return await proposeChanges(promptText, targetRels);
+      } finally {
+        timings.proposalMs.push(performance.now() - proposeStart);
+        s.stop();
       }
-      llmCalls.proposal += 1;
-      return proposeChanges(promptText, targetRels);
     };
 
-    s.start("Proponiendo y verificando con la puerta (tsc)...");
     const outcome = await runBoundedRetry<GatedChange>({ maxRetries, propose, gate });
-    s.stop();
 
     for (const line of attemptLines(outcome.attempts)) {
       log.info(pc.dim(line));
@@ -474,28 +544,41 @@ async function main(): Promise<void> {
         );
 
         if (consolidate) {
+          const mergeStart = performance.now();
           await mergeChanges(ws, "D-Engine: cambios consolidados en modo shadow", [
             ...new Set(applied.map((result) => result.filePath)),
           ]);
+          timings.mergeMs += performance.now() - mergeStart;
         } else {
           await destroyShadow(s, ws);
           shadowCreated = false;
           log.info("ensayo descartado, rama real intacta");
         }
       } else {
+        const mergeStart = performance.now();
         await mergeChanges(
           ws,
           mode.runAudit ? "D-Engine: cambios consolidados en modo verify" : "D-Engine: cambios consolidados en modo fast",
           [...new Set(applied.map((result) => result.filePath))]
         );
+        timings.mergeMs += performance.now() - mergeStart;
       }
     }
 
     const created = applied.filter((result) => result.strategy === "new-file").length;
     const edited = applied.length - created;
+    const attemptTokens = sumTokens(outcome.attempts);
+    const runTokens = attemptTokens.total + llmTokens.selector + llmTokens.audit;
+    const sessionMs = performance.now() - sessionStart;
+    const agentEstimate = resolveAgentTokenEstimate(process.env.D_ENGINE_AGENT_TOKEN_ESTIMATE);
     log.info(pc.dim("Resultado: ") + pc.white(`${created} archivo(s) creado(s)`) + pc.dim(" · ") + pc.white(`${edited} editado(s)`));
-    log.info(pc.dim("Tokens del run: ") + pc.white(tokenSummary(sumTokens(outcome.attempts).total)));
+    log.info(pc.dim("Tokens del run: ") + pc.white(tokenSummary(attemptTokens.total)));
     log.info(pc.dim(formatLlmCalls(llmCalls)));
+    log.info(pc.bold("Tiempos por fase:"));
+    for (const line of timingLines(timings, sessionMs)) {
+      log.info(pc.dim(`  ${line}`));
+    }
+    log.info(pc.magenta(costComparisonLine(runTokens, agentEstimate)));
     outro(pc.cyan("D-Engine") + pc.dim(" finalizado."));
   } finally {
     if (shadowCreated) {
