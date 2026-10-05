@@ -32,6 +32,18 @@ The toolbox is not the cost — **the agentic loop is**.
 4. Everything happens in a shadow git worktree. `tsc --noEmit` is the only source of truth.
 5. Green compile → merge. Anything else → nothing touches your branch.
 
+## Token ceilings per call type
+
+On metered tiers (for example Groq's free tier), the TPM quota is charged against the **declared** `max_tokens`, not the tokens actually produced — overshoot it and the request is rejected with HTTP 413. D-Engine's outputs are small by construction (selector ~5 completion tokens; proposer and audit 26–225 in measured runs), so every call declares its own ceiling instead of letting the provider assume a huge default:
+
+| Call | Env var | Default | Emergency | Absolute max |
+| --- | --- | --- | --- | --- |
+| Selector (P9) | `D_ENGINE_MAX_TOKENS_SELECTOR` | 500 | 2000 | 4000 |
+| Proposer | `D_ENGINE_MAX_TOKENS_PROPOSER` | 4096 | 16384 | 16384 |
+| Semantic audit | `D_ENGINE_MAX_TOKENS_AUDIT` | 500 | 2000 | 2000 |
+
+If the provider reports `finish_reason="length"`, the response is truncated and is never parsed as complete: that single call is retried once with the emergency ceiling (a visible warning), and the final summary counts it under `Escaladas por truncado`. If the emergency ceiling also truncates, the run fails with an explicit message. Garbage or non-positive values fall back to the default, and every value is clamped to its absolute max. Note that the emergency ceilings can exceed some providers' maximum output tokens (the provider would answer HTTP 400); in that case lower the absolute cap through the corresponding environment variable.
+
 ## Benchmark (headline)
 
 10 frozen tasks, same model family, one attempt each, full methodology disclosed:

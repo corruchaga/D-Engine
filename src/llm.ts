@@ -9,6 +9,69 @@ export interface ProposeResult {
   text: string;
   tokensIn: number;
   tokensOut: number;
+  escalated: boolean;
+}
+
+export interface CallLimits {
+  maxTokens: number;
+  emergencyMaxTokens: number;
+}
+
+export const DEFAULT_MAX_TOKENS_SELECTOR = 500;
+export const ABSOLUTE_MAX_TOKENS_SELECTOR = 4000;
+export const DEFAULT_MAX_TOKENS_PROPOSER = 4096;
+export const ABSOLUTE_MAX_TOKENS_PROPOSER = 16384;
+export const DEFAULT_MAX_TOKENS_AUDIT = 500;
+export const ABSOLUTE_MAX_TOKENS_AUDIT = 2000;
+
+export function resolveMaxTokens(
+  configured: string | number | undefined,
+  fallback: number,
+  absolute: number
+): number {
+  const clamp = (value: number): number => Math.max(1, Math.min(absolute, Math.trunc(value)));
+  if (typeof configured === "number") {
+    return Number.isFinite(configured) && configured > 0 ? clamp(configured) : fallback;
+  }
+  const raw = (configured ?? "").trim();
+  if (raw.length === 0) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return clamp(parsed);
+}
+
+export function resolveCallLimits(
+  configured: string | number | undefined,
+  fallback: number,
+  absolute: number
+): CallLimits {
+  const maxTokens = resolveMaxTokens(configured, fallback, absolute);
+  const emergencyMaxTokens = Math.min(absolute, Math.max(fallback, maxTokens * 4));
+  return { maxTokens, emergencyMaxTokens };
+}
+
+const SELECTOR_LIMITS: CallLimits = resolveCallLimits(
+  undefined,
+  DEFAULT_MAX_TOKENS_SELECTOR,
+  ABSOLUTE_MAX_TOKENS_SELECTOR
+);
+const PROPOSER_LIMITS: CallLimits = resolveCallLimits(
+  undefined,
+  DEFAULT_MAX_TOKENS_PROPOSER,
+  ABSOLUTE_MAX_TOKENS_PROPOSER
+);
+const AUDIT_LIMITS: CallLimits = resolveCallLimits(undefined, DEFAULT_MAX_TOKENS_AUDIT, ABSOLUTE_MAX_TOKENS_AUDIT);
+
+const MAX_TOKENS_ENV: Record<string, string> = {
+  selector: "D_ENGINE_MAX_TOKENS_SELECTOR",
+  proposer: "D_ENGINE_MAX_TOKENS_PROPOSER",
+  audit: "D_ENGINE_MAX_TOKENS_AUDIT",
+};
+
+let truncationEscalations = 0;
+
+export function getTruncationEscalations(): number {
+  return truncationEscalations;
 }
 
 interface ChatMessage {
@@ -72,22 +135,36 @@ function llmLog(tokensIn: number, tokensOut: number, label?: string): void {
 
 interface ChatOptions {
   label?: string;
-  maxTokens?: number;
+  limits: CallLimits;
+  call: string;
 }
 
-async function chatCompletions(messages: ChatMessage[], options: ChatOptions = {}): Promise<ProposeResult> {
+interface ChatResponse {
+  text: string;
+  tokensIn: number;
+  tokensOut: number;
+  finishReason: string | null;
+}
+
+function truncatedError(call: string, maxTokens: number): Error {
+  const variable = MAX_TOKENS_ENV[call] ?? "D_ENGINE_MAX_TOKENS_*";
+  return new Error(
+    `El LLM trunco la respuesta (finish_reason=length) con max_tokens=${maxTokens} en la llamada ${call}. Sube ${variable} o reduce el contexto.`
+  );
+}
+
+async function requestChat(messages: ChatMessage[], options: ChatOptions, maxTokens: number): Promise<ChatResponse> {
   const base = env("LLM_BASE_URL");
   const apiKey = env("LLM_API_KEY");
   const model = env("LLM_MODEL");
   const url = chatUrl(base);
 
-  const payload: {
-    model: string;
-    messages: ChatMessage[];
-    max_tokens?: number;
-    thinking: { type: "disabled" };
-  } = { model, messages, thinking: { type: "disabled" } };
-  if (options.maxTokens !== undefined) payload.max_tokens = options.maxTokens;
+  const payload = {
+    model,
+    messages,
+    max_tokens: maxTokens,
+    thinking: { type: "disabled" as const },
+  };
 
   let response: Response;
   try {
@@ -110,7 +187,7 @@ async function chatCompletions(messages: ChatMessage[], options: ChatOptions = {
   }
 
   let data: {
-    choices?: Array<{ message?: { content?: string | null } }>;
+    choices?: Array<{ message?: { content?: string | null }; finish_reason?: string | null }>;
     usage?: { prompt_tokens?: number; completion_tokens?: number };
   };
   try {
@@ -120,11 +197,34 @@ async function chatCompletions(messages: ChatMessage[], options: ChatOptions = {
   }
 
   const text = data.choices?.[0]?.message?.content ?? "";
+  const finishReason = data.choices?.[0]?.finish_reason ?? null;
   const tokensIn = data.usage?.prompt_tokens ?? 0;
   const tokensOut = data.usage?.completion_tokens ?? 0;
   if (options.label !== undefined) llmLog(tokensIn, tokensOut, options.label);
   else llmLog(tokensIn, tokensOut);
-  return { text, tokensIn, tokensOut };
+  return { text, tokensIn, tokensOut, finishReason };
+}
+
+async function chatCompletions(messages: ChatMessage[], options: ChatOptions): Promise<ProposeResult> {
+  const primary = await requestChat(messages, options, options.limits.maxTokens);
+  if (primary.finishReason !== "length") {
+    return { text: primary.text, tokensIn: primary.tokensIn, tokensOut: primary.tokensOut, escalated: false };
+  }
+
+  const emergency = options.limits.emergencyMaxTokens;
+  if (!(emergency > options.limits.maxTokens)) {
+    throw truncatedError(options.call, options.limits.maxTokens);
+  }
+
+  truncationEscalations += 1;
+  console.log(
+    `[d-engine:llm] ${options.call} TRUNCADO (finish_reason=length, max_tokens=${options.limits.maxTokens}): escalando a max_tokens=${emergency}`
+  );
+  const escalated = await requestChat(messages, options, emergency);
+  if (escalated.finishReason === "length") {
+    throw truncatedError(options.call, emergency);
+  }
+  return { text: escalated.text, tokensIn: escalated.tokensIn, tokensOut: escalated.tokensOut, escalated: true };
 }
 
 export const SELECTOR_SYSTEM = `Eres un selector de archivos. Responde UNICAMENTE un JSON array de strings con rutas posix del catalogo. Ejemplo: ["src/engine.ts"]. Prohibido markdown, explicaciones o rutas fuera de la lista. Elige el MINIMO conjunto necesario: los archivos a modificar Y, si el prompt pide actualizar usos, los que importen o usen esos simbolos. No incluyas archivos por si acaso.`;
@@ -136,7 +236,8 @@ function selectorUser(prompt: string, catalogText: string): string {
 export async function selectTargetFiles(
   prompt: string,
   catalogText: string,
-  retry?: { previousText: string; feedback: string }
+  retry?: { previousText: string; feedback: string },
+  limits: CallLimits = SELECTOR_LIMITS
 ): Promise<ProposeResult> {
   const messages: ChatMessage[] = [
     { role: "system", content: SELECTOR_SYSTEM },
@@ -146,7 +247,7 @@ export async function selectTargetFiles(
     messages.push({ role: "assistant", content: retry.previousText });
     messages.push({ role: "user", content: retry.feedback });
   }
-  return chatCompletions(messages, { label: "selector", maxTokens: 200 });
+  return chatCompletions(messages, { label: "selector", call: "selector", limits });
 }
 
 function userMessage(prompt: string, filePaths: string[], context: string): string {
@@ -174,12 +275,19 @@ function userMessage(prompt: string, filePaths: string[], context: string): stri
   ].join("\n");
 }
 
-export async function proposeChanges(prompt: string, filePaths: string[]): Promise<ProposeResult> {
+export async function proposeChanges(
+  prompt: string,
+  filePaths: string[],
+  limits: CallLimits = PROPOSER_LIMITS
+): Promise<ProposeResult> {
   const context = await buildContext(filePaths);
-  return chatCompletions([
-    { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: userMessage(prompt, filePaths, context) },
-  ]);
+  return chatCompletions(
+    [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: userMessage(prompt, filePaths, context) },
+    ],
+    { call: "proposer", limits }
+  );
 }
 
 const VERIFY_SYSTEM = `Eres un auditor semantico. Recibes un REQUISITO y un DIFF. Responde con exactamente una linea, sin markdown:
@@ -190,14 +298,21 @@ const VERIFY_SYSTEM = `Eres un auditor semantico. Recibes un REQUISITO y un DIFF
 
 No rechaces por estilo, nombres de tags ni convenciones. Esos casos son OK_CON_OBSERVACIONES, nunca FALLO.`;
 
-export async function verifyChanges(prompt: string, diff: string): Promise<ProposeResult> {
-  return chatCompletions([
-    { role: "system", content: VERIFY_SYSTEM },
-    {
-      role: "user",
-      content: [`REQUISITO:`, prompt, ``, `DIFF:`, diff.trim().length > 0 ? diff : "(sin cambios)"].join("\n"),
-    },
-  ]);
+export async function verifyChanges(
+  prompt: string,
+  diff: string,
+  limits: CallLimits = AUDIT_LIMITS
+): Promise<ProposeResult> {
+  return chatCompletions(
+    [
+      { role: "system", content: VERIFY_SYSTEM },
+      {
+        role: "user",
+        content: [`REQUISITO:`, prompt, ``, `DIFF:`, diff.trim().length > 0 ? diff : "(sin cambios)"].join("\n"),
+      },
+    ],
+    { call: "audit", limits }
+  );
 }
 
 function stripVerdictRest(trimmed: string, prefix: string): string {
@@ -225,13 +340,17 @@ export async function proposeCorrection(
   prompt: string,
   filePaths: string[],
   previousText: string,
-  correction: string = CORRECTION
+  correction: string = CORRECTION,
+  limits: CallLimits = PROPOSER_LIMITS
 ): Promise<ProposeResult> {
   const context = await buildContext(filePaths);
-  return chatCompletions([
-    { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: userMessage(prompt, filePaths, context) },
-    { role: "assistant", content: previousText },
-    { role: "user", content: correction },
-  ]);
+  return chatCompletions(
+    [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: userMessage(prompt, filePaths, context) },
+      { role: "assistant", content: previousText },
+      { role: "user", content: correction },
+    ],
+    { call: "proposer", limits }
+  );
 }

@@ -71,6 +71,10 @@ export function diaryTokenLine(tokens: number, shown: number, total: number): st
   return `Diario: ~${tokens} tokens (${label})`;
 }
 
+export function truncationEscalationLine(count: number): string {
+  return `Escaladas por truncado: ${Math.trunc(count)}`;
+}
+
 export function costComparisonLine(runTokens: number, estimate: number): string {
   const label = formatTokens(estimate);
   if (runTokens <= 0) {

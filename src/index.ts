@@ -19,11 +19,20 @@ import {
 import { buildSelectorCatalog } from "./context.js";
 import { buildDiary, resolveDiaryCommits } from "./diary.js";
 import {
+  ABSOLUTE_MAX_TOKENS_AUDIT,
+  ABSOLUTE_MAX_TOKENS_PROPOSER,
+  ABSOLUTE_MAX_TOKENS_SELECTOR,
+  DEFAULT_MAX_TOKENS_AUDIT,
+  DEFAULT_MAX_TOKENS_PROPOSER,
+  DEFAULT_MAX_TOKENS_SELECTOR,
+  getTruncationEscalations,
   parseVerifyVerdict,
   proposeChanges,
   proposeCorrection,
+  resolveCallLimits,
   selectTargetFiles,
   verifyChanges,
+  type CallLimits,
 } from "./llm.js";
 import {
   attemptLines,
@@ -46,6 +55,7 @@ import {
   formatSeconds,
   resolveAgentTokenEstimate,
   timingLines,
+  truncationEscalationLine,
 } from "./telemetry.js";
 
 type SecurityMode = "fast" | "verify" | "shadow";
@@ -209,7 +219,7 @@ async function askManualTargets(prefill?: string): Promise<string[]> {
   return parseTargets(String(targetRaw));
 }
 
-async function resolveTargetFiles(promptText: string): Promise<string[]> {
+async function resolveTargetFiles(promptText: string, selectorLimits: CallLimits): Promise<string[]> {
   const targetRaw = handleCancel(
     await text({
       message: "¿Archivo objetivo? (Enter vacio = seleccion automatica)",
@@ -250,7 +260,7 @@ async function resolveTargetFiles(promptText: string): Promise<string[]> {
   }
 
   try {
-    let result = await selectTargetFiles(promptText, catalog.text);
+    let result = await selectTargetFiles(promptText, catalog.text, undefined, selectorLimits);
     llmCalls.selector += 1;
     llmTokens.selector += result.tokensIn + result.tokensOut;
     let resolved = resolveSelectorPaths(result.text, catalog.candidates, { allowNew: true });
@@ -260,10 +270,15 @@ async function resolveTargetFiles(promptText: string): Promise<string[]> {
         resolved.reason === "formato invalido"
           ? "formato invalido; responde solo un JSON array de rutas del catalogo o de archivos nuevos bajo src/"
           : `${resolved.reason}; responde solo un JSON array de rutas del catalogo o de archivos nuevos bajo src/`;
-      result = await selectTargetFiles(promptText, catalog.text, {
-        previousText: result.text,
-        feedback,
-      });
+      result = await selectTargetFiles(
+        promptText,
+        catalog.text,
+        {
+          previousText: result.text,
+          feedback,
+        },
+        selectorLimits
+      );
       llmCalls.selector += 1;
       llmTokens.selector += result.tokensIn + result.tokensOut;
       resolved = resolveSelectorPaths(result.text, catalog.candidates, { allowNew: true });
@@ -341,7 +356,23 @@ async function main(): Promise<void> {
     })
   );
 
-  const targetRels = await resolveTargetFiles(promptText);
+  const selectorLimits = resolveCallLimits(
+    process.env.D_ENGINE_MAX_TOKENS_SELECTOR,
+    DEFAULT_MAX_TOKENS_SELECTOR,
+    ABSOLUTE_MAX_TOKENS_SELECTOR
+  );
+  const proposerLimits = resolveCallLimits(
+    process.env.D_ENGINE_MAX_TOKENS_PROPOSER,
+    DEFAULT_MAX_TOKENS_PROPOSER,
+    ABSOLUTE_MAX_TOKENS_PROPOSER
+  );
+  const auditLimits = resolveCallLimits(
+    process.env.D_ENGINE_MAX_TOKENS_AUDIT,
+    DEFAULT_MAX_TOKENS_AUDIT,
+    ABSOLUTE_MAX_TOKENS_AUDIT
+  );
+
+  const targetRels = await resolveTargetFiles(promptText, selectorLimits);
 
   const modeRaw = handleCancel(
     await select({
@@ -386,6 +417,15 @@ async function main(): Promise<void> {
     pc.dim("Diario: ") +
       (diaryCommits > 0 ? pc.white("ON") : pc.white("OFF")) +
       pc.dim(` (${diaryCommits} commits) (D_ENGINE_DIARY_COMMITS)`)
+  );
+  log.info(
+    pc.dim("Techos max_tokens: ") +
+      pc.white(`selector ${selectorLimits.maxTokens} (emerg. ${selectorLimits.emergencyMaxTokens})`) +
+      pc.dim(" · ") +
+      pc.white(`proposer ${proposerLimits.maxTokens} (emerg. ${proposerLimits.emergencyMaxTokens})`) +
+      pc.dim(" · ") +
+      pc.white(`auditoria ${auditLimits.maxTokens} (emerg. ${auditLimits.emergencyMaxTokens})`) +
+      pc.dim(" (D_ENGINE_MAX_TOKENS_*)")
   );
 
   let diarySection = "";
@@ -518,7 +558,7 @@ async function main(): Promise<void> {
         let auditError = "";
         try {
           const diff = await ws.diffHead([...new Set(okResult.value.applied.map((r) => r.filePath))]);
-          audit = await verifyChanges(promptText, diff);
+          audit = await verifyChanges(promptText, diff, auditLimits);
         } catch (error) {
           auditError = error instanceof Error ? error.message : String(error);
         }
@@ -574,10 +614,16 @@ async function main(): Promise<void> {
       try {
         if (feedback) {
           llmCalls.retries += 1;
-          return await proposeCorrection(proposerPrompt, targetRels, feedback.previousText, feedback.message);
+          return await proposeCorrection(
+            proposerPrompt,
+            targetRels,
+            feedback.previousText,
+            feedback.message,
+            proposerLimits
+          );
         }
         llmCalls.proposal += 1;
-        return await proposeChanges(proposerPrompt, targetRels);
+        return await proposeChanges(proposerPrompt, targetRels, proposerLimits);
       } finally {
         timings.proposalMs.push(performance.now() - proposeStart);
         s.stop();
@@ -608,7 +654,7 @@ async function main(): Promise<void> {
       if (mode.runAudit) {
         s.start("Auditoria semantica (2da llamada LLM)...");
         const diff = await ws.diffHead([...new Set(applied.map((result) => result.filePath))]);
-        const audit = await verifyChanges(promptText, diff);
+        const audit = await verifyChanges(promptText, diff, auditLimits);
         llmCalls.audit += 1;
         llmTokens.audit += audit.tokensIn + audit.tokensOut;
         s.stop();
@@ -678,6 +724,8 @@ async function main(): Promise<void> {
       log.info(pc.dim(diaryTokenLine(diaryTokens, diaryShown, diaryTotal)));
     }
     log.info(pc.dim(formatLlmCalls(llmCalls)));
+    const truncationEscalations = getTruncationEscalations();
+    log.info((truncationEscalations > 0 ? pc.yellow : pc.dim)(truncationEscalationLine(truncationEscalations)));
     if (mergeOutcome.merged && fuzzyAuditUnavailable > 0) {
       log.warn(
         pc.yellow(
