@@ -66,6 +66,11 @@ export function timingLines(timings: PhaseTimings, sessionMs: number): string[] 
   return lines;
 }
 
+export function diaryTokenLine(tokens: number, shown: number, total: number): string {
+  const label = shown < total ? `${shown} de ${total} commits` : shown === 1 ? "1 commit" : `${shown} commits`;
+  return `Diario: ~${tokens} tokens (${label})`;
+}
+
 export function costComparisonLine(runTokens: number, estimate: number): string {
   const label = formatTokens(estimate);
   if (runTokens <= 0) {

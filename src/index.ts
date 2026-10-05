@@ -17,6 +17,7 @@ import {
   type ParsedBlock,
 } from "./engine.js";
 import { buildSelectorCatalog } from "./context.js";
+import { buildDiary, resolveDiaryCommits } from "./diary.js";
 import {
   parseVerifyVerdict,
   proposeChanges,
@@ -40,6 +41,7 @@ import { isSafeNewPath, normalizeRel, resolveSelectorPaths } from "./selector.js
 import {
   costComparisonLine,
   createPhaseTimings,
+  diaryTokenLine,
   firstLines,
   formatSeconds,
   resolveAgentTokenEstimate,
@@ -369,6 +371,7 @@ async function main(): Promise<void> {
 
   const maxRetries = resolveMaxRetries(process.env.D_ENGINE_MAX_RETRIES);
   const fuzzyVerifyOn = resolveFuzzyVerify(process.env.D_ENGINE_FUZZY_VERIFY);
+  const diaryCommits = resolveDiaryCommits(process.env.D_ENGINE_DIARY_COMMITS);
 
   log.info(pc.dim("Prompt recibido: ") + pc.white(promptText));
   log.info(pc.dim("Modo de seguridad: ") + pc.magenta(mode.label) + pc.dim(`  (${mode.llmCalls} llamada(s) LLM)`));
@@ -379,6 +382,29 @@ async function main(): Promise<void> {
       (fuzzyVerifyOn ? pc.white("ON") : pc.white("OFF")) +
       pc.dim(" (D_ENGINE_FUZZY_VERIFY)")
   );
+  log.info(
+    pc.dim("Diario: ") +
+      (diaryCommits > 0 ? pc.white("ON") : pc.white("OFF")) +
+      pc.dim(` (${diaryCommits} commits) (D_ENGINE_DIARY_COMMITS)`)
+  );
+
+  let diarySection = "";
+  let diaryShown = 0;
+  let diaryTotal = 0;
+  let diaryTokens = 0;
+  if (diaryCommits > 0) {
+    try {
+      const diary = await buildDiary(process.cwd(), targetRels, { maxCommits: diaryCommits });
+      diarySection = diary.section;
+      diaryShown = diary.commits;
+      diaryTotal = diary.totalCommits;
+      diaryTokens = diary.tokensEstimate;
+    } catch (error) {
+      log.warn(pc.yellow("Diario no disponible (git fallo) - el run continua sin diario"));
+      log.info(pc.dim(`  ${error instanceof Error ? error.message : String(error)}`));
+    }
+  }
+  const proposerPrompt = diarySection.length > 0 ? `${promptText}\n\n${diarySection}` : promptText;
 
   const s = spinner();
   const ws = new ShadowWorkspace();
@@ -548,10 +574,10 @@ async function main(): Promise<void> {
       try {
         if (feedback) {
           llmCalls.retries += 1;
-          return await proposeCorrection(promptText, targetRels, feedback.previousText, feedback.message);
+          return await proposeCorrection(proposerPrompt, targetRels, feedback.previousText, feedback.message);
         }
         llmCalls.proposal += 1;
-        return await proposeChanges(promptText, targetRels);
+        return await proposeChanges(proposerPrompt, targetRels);
       } finally {
         timings.proposalMs.push(performance.now() - proposeStart);
         s.stop();
@@ -648,6 +674,9 @@ async function main(): Promise<void> {
     const agentEstimate = resolveAgentTokenEstimate(process.env.D_ENGINE_AGENT_TOKEN_ESTIMATE);
     log.info(pc.dim("Resultado: ") + pc.white(`${created} archivo(s) creado(s)`) + pc.dim(" · ") + pc.white(`${edited} editado(s)`));
     log.info(pc.dim("Tokens del run: ") + pc.white(tokenSummary(attemptTokens.total)));
+    if (diarySection.length > 0) {
+      log.info(pc.dim(diaryTokenLine(diaryTokens, diaryShown, diaryTotal)));
+    }
     log.info(pc.dim(formatLlmCalls(llmCalls)));
     if (mergeOutcome.merged && fuzzyAuditUnavailable > 0) {
       log.warn(

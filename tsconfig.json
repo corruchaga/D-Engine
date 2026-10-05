@@ -19,5 +19,5 @@
     "skipLibCheck": true
   },
   "include": ["src"],
-  "exclude": ["src/test-p3.ts", "src/test-p9.ts", "src/test-newfile.ts", "src/test-retry.ts", "src/test-fuzzy-verify.ts"]
+  "exclude": ["src/test-p3.ts", "src/test-p9.ts", "src/test-newfile.ts", "src/test-retry.ts", "src/test-fuzzy-verify.ts", "src/test-diary.ts"]
 }
