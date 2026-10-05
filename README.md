@@ -44,6 +44,7 @@ The toolbox is not the cost — **the agentic loop is**.
 | Broken commits on main | 0 | 1 (Aider, trap task) |
 
 Tied quality, **14–42× fewer tokens**, a predictable bill, zero broken merges. The full benchmark — frozen prompts, voided rows, hallucination incident and all — ships in [docs/benchmark.en.md](docs/benchmark.en.md) ([español](docs/benchmark.md)).
+
 ## Install & usage
 
 Requirements: Node.js, git, TypeScript in the target repo (`tsc --noEmit`).
@@ -70,19 +71,19 @@ npm run build
 npm start
 ```
 
-The TUI asks for: change description, target file (empty Enter = automatic selector), safety mode (Fast / Verify / Shadow) and confirmation. Fast merges after applying; Verify adds a semantic audit; Shadow never merges without permission.
+The TUI asks for: change description, target file (empty Enter = automatic selector), safety mode (Fast / Verify / Shadow) and confirmation. The target file may not exist yet: it gets labeled NEW and the proposer creates it with a NEW FILE block. Fast merges after applying; Verify adds a semantic audit; Shadow never merges without permission.
 
 `npm run typecheck` is equivalent to `tsc --noEmit`.
 
 ## Known limitations
 
-- Cannot create new files (yet — see roadmap).
 - Fuzzy matching (0.85 threshold) is the weak link.
 - The P9 file selector is not deterministic.
+- Creates files but does not rename or delete them (planned for a later phase).
 
 ## Roadmap v0.3
 
-- New-file creation
+- ~~New-file creation~~ (done)
 - Retry loop with compiler feedback
 - Mandatory Verify when a patch applied via fuzzy
 - Time and tokens in the final summary

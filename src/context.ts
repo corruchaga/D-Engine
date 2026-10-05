@@ -182,8 +182,13 @@ export async function buildContext(targetFiles: string[]): Promise<string> {
   }
 
   for (const rel of targetRels) {
-    const targetContent = readFileSync(path.join(root, rel), "utf8");
-    parts.push(`# ${rel}\n\n${targetContent}`);
+    const abs = path.join(root, rel);
+    if (existsSync(abs)) {
+      const targetContent = readFileSync(abs, "utf8");
+      parts.push(`# ${rel}\n\n${targetContent}`);
+    } else {
+      parts.push(`# ${rel} (ARCHIVO NUEVO: no existe todavia, se creara con NEW FILE)`);
+    }
     order.push(rel);
   }
 

@@ -1,5 +1,5 @@
 import { config } from "dotenv";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { buildContext } from "./context.js";
 
@@ -16,9 +16,9 @@ interface ChatMessage {
   content: string;
 }
 
-const SYSTEM_PROMPT = `Eres un editor de codigo determinista. Responde UNICAMENTE con uno o mas bloques SEARCH/REPLACE en formato diff-fenced. Prohibido cualquier explicacion, comentario, saludo o markdown fuera de los bloques.
+const SYSTEM_PROMPT = `Eres un editor de codigo determinista. Responde UNICAMENTE con bloques SEARCH/REPLACE (editar archivos existentes) o bloques NEW FILE (crear archivos nuevos). Prohibido cualquier explicacion, comentario, saludo o markdown fuera de los bloques.
 
-Formato obligatorio (diff-fenced):
+Formato SEARCH/REPLACE (archivo existente, diff-fenced):
 
 \`\`\`diff ruta/al/archivo.ext
 <<<<<<< SEARCH
@@ -28,7 +28,17 @@ codigo de reemplazo
 >>>>>>> REPLACE
 \`\`\`
 
+Formato NEW FILE (archivo nuevo):
+
+NEW FILE: ruta/al/archivo.ext
+<<<EOF
+contenido completo del archivo
+EOF
+
 Reglas:
+- Usa NEW FILE SOLO si el archivo NO existe todavia. Si existe, usa SEARCH/REPLACE.
+- En NEW FILE, tras "NEW FILE:" escribe la ruta; la siguiente linea debe ser exactamente <<<EOF; escribe el contenido COMPLETO; cierra con una linea que sea exactamente EOF. No uses una linea EOF dentro del contenido.
+- No envuelvas el contenido de NEW FILE en fences de markdown ni anadas texto despues de EOF.
 - SEARCH debe copiar el codigo existente con exactitud de caracteres: espacios, indentacion y saltos de linea identicos al archivo.
 - SEARCH debe ser un fragmento unico en el archivo.
 - No inventes rutas. Usa exactamente las rutas de archivo objetivo indicadas.
@@ -36,7 +46,7 @@ Reglas:
 - Si hay varios cambios, emite varios bloques. Nada mas.`;
 
 const CORRECTION =
-  "tu respuesta no contenía bloques SEARCH/REPLACE válidos; responde solo con bloques";
+  "tu respuesta no contenía bloques SEARCH/REPLACE ni NEW FILE válidos; responde solo con bloques";
 
 function env(name: string): string {
   const value = process.env[name]?.trim();
@@ -140,18 +150,24 @@ export async function selectTargetFiles(
 }
 
 function userMessage(prompt: string, filePaths: string[], context: string): string {
-  const listed = filePaths.flatMap((filePath) => [
-    `ARCHIVO: ${filePath}`,
-    ``,
-    readFileSync(path.resolve(process.cwd(), filePath), "utf8"),
-    ``,
-  ]);
+  const listed = filePaths.flatMap((filePath) => {
+    const abs = path.resolve(process.cwd(), filePath);
+    if (existsSync(abs)) {
+      return [`ARCHIVO: ${filePath}`, ``, readFileSync(abs, "utf8"), ``];
+    }
+    return [
+      `ARCHIVO NUEVO (no existe todavia): ${filePath}`,
+      ``,
+      `Debes crearlo con un bloque NEW FILE: ${filePath}`,
+      ``,
+    ];
+  });
   return [
     `Prompt del usuario:`,
     prompt,
     ``,
     ...listed,
-    `Usa exactamente esas rutas en la cabecera de cada bloque. Puedes emitir bloques para uno o varios de esos archivos. No las acortes ni las cambies.`,
+    `Usa exactamente esas rutas. Para cada ARCHIVO NUEVO emite un bloque NEW FILE; para cada ARCHIVO existente emite SEARCH/REPLACE. No las acortes ni las cambies.`,
     ``,
     `Contexto:`,
     context,

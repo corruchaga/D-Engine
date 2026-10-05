@@ -1,5 +1,5 @@
 import { execa } from "execa";
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -91,6 +91,18 @@ async function logOffendingDiffs(cwd: string, files: string[]): Promise<void> {
   }
 }
 
+function unlinkIfLink(target: string): void {
+  try {
+    if (!existsSync(target)) return;
+    if (!lstatSync(target).isSymbolicLink()) return;
+    rmSync(target, { recursive: false, force: true });
+    gitLog(`enlace quitado antes del borrado: ${target}`);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    gitLog(`no se pudo quitar el enlace ${target}: ${reason}`);
+  }
+}
+
 export class ShadowWorkspace {
   private branch = "";
   private worktreePath = "";
@@ -133,6 +145,7 @@ export class ShadowWorkspace {
     const root = this.repoRoot || process.cwd();
 
     if (this.worktreePath) {
+      unlinkIfLink(path.join(this.worktreePath, "node_modules"));
       await runGit(
         ["worktree", "remove", "--force", this.worktreePath],
         "borrar worktree (primero)",
@@ -167,9 +180,24 @@ export class ShadowWorkspace {
     const photocopy = this.worktreePath;
     const unique = [...new Set(files.map(normalizeRepoPath).filter(Boolean))];
     if (!photocopy || unique.length === 0) return;
-    await runGit(["checkout", "HEAD", "--", ...unique], "restaurar archivos al HEAD de la fotocopia", {
-      cwd: photocopy,
-    });
+    for (const rel of unique) {
+      const tree = await runGit(["ls-tree", "HEAD", "--", rel], `ver si ${rel} existe en HEAD`, {
+        cwd: photocopy,
+        allowFail: true,
+      });
+      if (tree.trim().length > 0) {
+        await runGit(["checkout", "HEAD", "--", rel], `restaurar ${rel} al HEAD de la fotocopia`, {
+          cwd: photocopy,
+          allowFail: true,
+        });
+        continue;
+      }
+      const abs = path.join(photocopy, rel);
+      if (existsSync(abs)) {
+        unlinkSync(abs);
+        gitLog(`restaurar: borrado archivo nuevo ${rel}`);
+      }
+    }
   }
 
   async commitAndMerge(message: string, files: string[]): Promise<boolean> {
@@ -261,7 +289,7 @@ export class ShadowWorkspace {
     return (await runGit(["log", "-1", "--oneline"], "git log -1 (master/HEAD)", { cwd: root })).trim();
   }
 
-  async diffHead(): Promise<string> {
+  async diffHead(newFiles: string[] = []): Promise<string> {
     const photocopy = this.worktreePath;
     gitLog("diff HEAD en la FOTOCOPIA");
     gitLog(`  cwd: ${photocopy}`);
@@ -269,22 +297,49 @@ export class ShadowWorkspace {
     const result = await execa("git", ["diff", "HEAD"], { cwd: photocopy, reject: false });
     const stdout = result.stdout.trim();
     gitLog(stdout.length > 0 ? `  ok stdout:\n${stdout}` : "  ok (sin stdout)");
-    return result.stdout;
+
+    const extras: string[] = [];
+    for (const rel of [...new Set(newFiles.map(normalizeRepoPath).filter(Boolean))]) {
+      const abs = path.join(photocopy, rel);
+      if (!existsSync(abs)) continue;
+      const tracked = await runGit(["ls-files", "--error-unmatch", "--", rel], `ver si ${rel} esta trackeado`, {
+        cwd: photocopy,
+        allowFail: true,
+      });
+      if (tracked.trim().length > 0) continue;
+      const diff = await execa("git", ["diff", "--no-index", "--", "/dev/null", rel], {
+        cwd: photocopy,
+        reject: false,
+      });
+      if (diff.stdout.trim().length > 0) extras.push(diff.stdout);
+    }
+
+    return [result.stdout, ...extras].join("\n");
   }
 }
 
 export interface EditBlock {
+  kind: "edit";
   filePath: string;
   search: string;
   replace: string;
 }
+
+export interface NewFileBlock {
+  kind: "new";
+  filePath: string;
+  content: string;
+}
+
+export type ParsedBlock = EditBlock | NewFileBlock;
 
 export type ApplyStrategy =
   | "exact"
   | "normalize-newlines"
   | "ignore-trailing-whitespace"
   | "fuzzy"
-  | "rewrite";
+  | "rewrite"
+  | "new-file";
 
 export interface ApplyResult {
   filePath: string;
@@ -294,8 +349,13 @@ export interface ApplyResult {
 const FUZZY_THRESHOLD = 0.85;
 const SMALL_FILE_CHARS = 1200;
 
-const BLOCK_RE =
-  /<<<<<<< SEARCH[^\n]*\r?\n([\s\S]*?)\r?\n=======[^\n]*\r?\n([\s\S]*?)\r?\n>>>>>>> REPLACE/g;
+const EDIT_BLOCK_SRC =
+  "<<<<<<< SEARCH[^\\n]*\\r?\\n([\\s\\S]*?)\\r?\\n=======[^\\n]*\\r?\\n([\\s\\S]*?)\\r?\\n>>>>>>> REPLACE";
+
+const NEW_FILE_SRC =
+  "^[ \\t]*NEW FILE:[ \\t]*([^\\r\\n]+?)[ \\t]*\\r?\\n[ \\t]*<<<[ \\t]*EOF[ \\t]*\\r?\\n([\\s\\S]*?)^[ \\t]*EOF[ \\t]*$";
+
+const BLOCK_RE = new RegExp(`(${EDIT_BLOCK_SRC})|(${NEW_FILE_SRC})`, "gim");
 
 function stripDecor(value: string): string {
   return value.replace(/^[`"'*]+|[`"'*]+$/g, "").trim();
@@ -328,20 +388,64 @@ function extractPathBefore(before: string): string {
   throw new Error("Bloque SEARCH/REPLACE sin ruta de archivo.");
 }
 
+export function assertSafeNewPath(raw: string): string {
+  const rel = normalizeRepoPath(raw).trim();
+  const label = raw.trim().length > 0 ? raw.trim() : "(vacia)";
+  if (!rel) {
+    throw new Error("NEW FILE con ruta vacia.");
+  }
+  if (rel.startsWith("/") || /^[A-Za-z]:/.test(rel)) {
+    throw new Error(`NEW FILE con ruta absoluta no permitida: ${label}`);
+  }
+  if (rel.split("/").includes("..")) {
+    throw new Error(`NEW FILE con ".." no permitido: ${label}`);
+  }
+  if (!/^[\w.@-]+(?:\/[\w.@-]+)*$/.test(rel)) {
+    throw new Error(`NEW FILE con ruta invalida: ${label}`);
+  }
+  return rel;
+}
+
+function assertNewFileContent(rel: string, content: string): void {
+  if (content.trim().length === 0) {
+    throw new Error(`NEW FILE sin contenido: ${rel}`);
+  }
+}
+
+export function isSafeNewPath(rel: string): boolean {
+  try {
+    assertSafeNewPath(rel);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export class LLMParser {
-  static parse(markdown: string): EditBlock[] {
-    const blocks: EditBlock[] = [];
-    const re = new RegExp(BLOCK_RE.source, "g");
+  static parse(markdown: string): ParsedBlock[] {
+    const blocks: ParsedBlock[] = [];
+    const re = new RegExp(BLOCK_RE.source, BLOCK_RE.flags);
     let match: RegExpExecArray | null;
     while ((match = re.exec(markdown)) !== null) {
-      const search = match[1];
-      const replace = match[2];
-      if (search === undefined || replace === undefined) continue;
-      const filePath = extractPathBefore(markdown.slice(0, match.index));
-      blocks.push({ filePath, search, replace });
+      if (match[1] !== undefined) {
+        const search = match[2];
+        const replace = match[3];
+        if (search === undefined || replace === undefined) continue;
+        const filePath = extractPathBefore(markdown.slice(0, match.index));
+        blocks.push({ kind: "edit", filePath, search, replace });
+        continue;
+      }
+      const rawPath = match[5];
+      const content = match[6];
+      if (rawPath === undefined || content === undefined) continue;
+      const rel = assertSafeNewPath(stripDecor(rawPath));
+      assertNewFileContent(rel, content);
+      blocks.push({ kind: "new", filePath: rel, content });
     }
     if (blocks.length === 0) {
-      throw new Error("No se encontro ningun bloque SEARCH/REPLACE valido en la respuesta del modelo.");
+      throw new Error(
+        "No se encontro ningun bloque SEARCH/REPLACE ni NEW FILE valido en la respuesta del modelo."
+      );
     }
     return blocks;
   }
@@ -503,7 +607,38 @@ function previewSearch(search: string): string {
 }
 
 export class LocalEditor {
-  static apply(rootDir: string, block: EditBlock): ApplyResult {
+  static preflight(rootDir: string, blocks: ParsedBlock[]): void {
+    const created = new Set<string>();
+    for (const block of blocks) {
+      if (block.kind === "new") {
+        const rel = assertSafeNewPath(block.filePath);
+        assertNewFileContent(rel, block.content);
+        if (created.has(rel)) {
+          throw new Error(`NEW FILE duplicado en el mismo parche: ${rel}`);
+        }
+        const abs = path.join(rootDir, rel);
+        if (existsSync(abs)) {
+          throw new Error(
+            `NEW FILE rechazado: ${rel} ya existe en la fotocopia. Usa SEARCH/REPLACE para editarlo.`
+          );
+        }
+        created.add(rel);
+        continue;
+      }
+      const rel = normalizeRepoPath(block.filePath);
+      if (!existsSync(path.join(rootDir, rel))) {
+        throw new Error(
+          `SEARCH/REPLACE sobre un archivo que no existe: ${rel}. Para crearlo usa un bloque NEW FILE.`
+        );
+      }
+    }
+  }
+
+  static apply(rootDir: string, block: ParsedBlock): ApplyResult {
+    if (block.kind === "new") {
+      return LocalEditor.create(rootDir, block);
+    }
+
     const abs = path.join(rootDir, block.filePath);
     if (!existsSync(abs)) {
       throw new Error(`El archivo no existe en la fotocopia: ${block.filePath}`);
@@ -531,6 +666,20 @@ export class LocalEditor {
 
     writeFileSync(abs, applied.content, "utf8");
     return { filePath: block.filePath, strategy: applied.strategy };
+  }
+
+  private static create(rootDir: string, block: NewFileBlock): ApplyResult {
+    const rel = assertSafeNewPath(block.filePath);
+    assertNewFileContent(rel, block.content);
+    const abs = path.join(rootDir, rel);
+    if (existsSync(abs)) {
+      throw new Error(
+        `NEW FILE rechazado: ${rel} ya existe en la fotocopia. Usa SEARCH/REPLACE para editarlo.`
+      );
+    }
+    mkdirSync(path.dirname(abs), { recursive: true });
+    writeFileSync(abs, block.content, "utf8");
+    return { filePath: rel, strategy: "new-file" };
   }
 }
 

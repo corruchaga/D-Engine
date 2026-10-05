@@ -3,10 +3,25 @@ import { intro, outro, text, select, confirm, spinner, log, cancel, isCancel } f
 import { copyFileSync, existsSync, mkdirSync, symlinkSync } from "node:fs";
 import path from "node:path";
 import pc from "picocolors";
-import { LLMParser, LocalEditor, PorcelainGuardError, ShadowWorkspace, Validator, type EditBlock } from "./engine.js";
+import {
+  LLMParser,
+  LocalEditor,
+  PorcelainGuardError,
+  ShadowWorkspace,
+  Validator,
+  type ApplyResult,
+  type ParsedBlock,
+} from "./engine.js";
 import { buildSelectorCatalog } from "./context.js";
-import { parseVerifyVerdict, proposeChanges, proposeCorrection, selectTargetFiles, verifyChanges } from "./llm.js";
-import { normalizeRel, resolveSelectorPaths } from "./selector.js";
+import {
+  parseVerifyVerdict,
+  proposeChanges,
+  proposeCorrection,
+  selectTargetFiles,
+  verifyChanges,
+  type ProposeResult,
+} from "./llm.js";
+import { isSafeNewPath, normalizeRel, resolveSelectorPaths } from "./selector.js";
 
 type SecurityMode = "fast" | "verify" | "shadow";
 
@@ -110,8 +125,26 @@ function ensureDemoFile(worktreePath: string, rel: string): void {
   copyFileSync(src, dest);
 }
 
-function withNormalizedPaths(blocks: EditBlock[]): EditBlock[] {
+function withNormalizedPaths(blocks: ParsedBlock[]): ParsedBlock[] {
   return blocks.map((block) => ({ ...block, filePath: normalizeRel(block.filePath) }));
+}
+
+function isNewTarget(rel: string): boolean {
+  return !existsSync(path.resolve(process.cwd(), rel));
+}
+
+function formatTargets(rels: string[]): string {
+  return rels.map((rel) => (isNewTarget(rel) ? `${rel} ${pc.yellow("(NUEVO)")}` : rel)).join(", ");
+}
+
+function logApplied(results: ApplyResult[]): void {
+  for (const result of results) {
+    if (result.strategy === "new-file") {
+      log.success(pc.green(`Archivo creado ${result.filePath} (new-file)`));
+    } else {
+      log.success(pc.green(`Parche aplicado en ${result.filePath} (${result.strategy})`));
+    }
+  }
 }
 
 function parseTargets(value: string): string[] {
@@ -129,8 +162,15 @@ function parseTargets(value: string): string[] {
 function validateTargetInput(value: string): string | undefined {
   const rels = parseTargets(value);
   if (rels.length === 0) return "Indica al menos un archivo.";
-  const missing = rels.filter((rel) => !existsSync(path.resolve(process.cwd(), rel)));
-  if (missing.length > 0) return `El archivo no existe en el repo: ${missing.join(", ")}`;
+  const unsafe = rels.filter((rel) => !isSafeNewPath(rel));
+  if (unsafe.length > 0) {
+    return `Ruta invalida (debe ser relativa, sin ".."): ${unsafe.join(", ")}`;
+  }
+  const missing = rels.filter((rel) => isNewTarget(rel));
+  if (missing.length > 0) {
+    log.info(pc.dim("Archivos nuevos a crear: ") + pc.yellow(missing.join(", ")));
+  }
+  return undefined;
 }
 
 async function askManualTargets(prefill?: string): Promise<string[]> {
@@ -179,29 +219,29 @@ async function resolveTargetFiles(promptText: string): Promise<string[]> {
   try {
     let result = await selectTargetFiles(promptText, catalog.text);
     llmCalls.selector += 1;
-    let resolved = resolveSelectorPaths(result.text, catalog.candidates);
+    let resolved = resolveSelectorPaths(result.text, catalog.candidates, { allowNew: true });
     if (!resolved.ok) {
       log.warn(`Selector: ${resolved.reason}. Reintentando una vez...`);
       const feedback =
         resolved.reason === "formato invalido"
-          ? "formato invalido; responde solo un JSON array de rutas del catalogo"
-          : `${resolved.reason}; responde solo un JSON array de rutas del catalogo`;
+          ? "formato invalido; responde solo un JSON array de rutas del catalogo o de archivos nuevos bajo src/"
+          : `${resolved.reason}; responde solo un JSON array de rutas del catalogo o de archivos nuevos bajo src/`;
       result = await selectTargetFiles(promptText, catalog.text, {
         previousText: result.text,
         feedback,
       });
       llmCalls.selector += 1;
-      resolved = resolveSelectorPaths(result.text, catalog.candidates);
+      resolved = resolveSelectorPaths(result.text, catalog.candidates, { allowNew: true });
     }
     spin.stop();
     if (!resolved.ok) {
       log.warn("El selector no devolvio rutas validas. Elige archivos a mano.");
       return askManualTargets();
     }
-    log.info(pc.dim("Seleccion automatica: ") + pc.cyan(resolved.paths.join(", ")));
+    log.info(pc.dim("Seleccion automatica: ") + formatTargets(resolved.paths));
     const choice = handleCancel(
       await select({
-        message: "¿Usar estos archivos?",
+        message: `¿Usar estos archivos?\n${formatTargets(resolved.paths)}`,
         options: [
           { value: "yes", label: "si" },
           { value: "edit", label: "editar manualmente" },
@@ -217,9 +257,59 @@ async function resolveTargetFiles(promptText: string): Promise<string[]> {
   }
 }
 
-function unauthorizedBlockPaths(blocks: EditBlock[], targets: string[]): string[] {
+function unauthorizedBlockPaths(blocks: ParsedBlock[], targets: string[]): string[] {
   const allowed = new Set(targets);
   return [...new Set(blocks.map((block) => block.filePath).filter((rel) => !allowed.has(rel)))];
+}
+
+interface ApplyOutcome {
+  applied: ApplyResult[];
+  proposal: ProposeResult;
+  blocks: ParsedBlock[];
+}
+
+async function applyWithRetry(
+  ws: ShadowWorkspace,
+  promptText: string,
+  targetRels: string[],
+  initialProposal: ProposeResult,
+  initialBlocks: ParsedBlock[]
+): Promise<ApplyOutcome> {
+  const worktreePath = ws.path;
+  const materialize = (current: ParsedBlock[]): ApplyResult[] => {
+    for (const block of current) ensureDemoFile(worktreePath, block.filePath);
+    LocalEditor.preflight(worktreePath, current);
+    return current.map((block) => LocalEditor.apply(worktreePath, block));
+  };
+
+  try {
+    return { applied: materialize(initialBlocks), proposal: initialProposal, blocks: initialBlocks };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    log.warn(`No se pudo materializar el parche: ${reason}. Reintentando una vez...`);
+    const feedback = [
+      "no se pudo materializar el parche en la fotocopia.",
+      reason,
+      "Corrige el tipo de bloque: usa NEW FILE solo para archivos que no existen y SEARCH/REPLACE para archivos existentes.",
+      "Responde solo con bloques validos.",
+    ].join("\n");
+    const corrected = await proposeCorrection(promptText, targetRels, initialProposal.text, feedback);
+    llmCalls.proposal += 1;
+    let correctedBlocks: ParsedBlock[];
+    try {
+      correctedBlocks = withNormalizedPaths(LLMParser.parse(corrected.text));
+    } catch {
+      throw new Error("El LLM no devolvio bloques validos al corregir la materializacion del parche.");
+    }
+    const missing = unauthorizedBlockPaths(correctedBlocks, targetRels);
+    if (missing.length > 0) {
+      throw new Error(
+        `El archivo del bloque no es un objetivo (apuntaba a ${missing[0] ?? "(desconocida)"}; los objetivos son ${targetRels.join(", ")}).`
+      );
+    }
+    await ws.restoreFiles(initialBlocks.map((block) => block.filePath));
+    return { applied: materialize(correctedBlocks), proposal: corrected, blocks: correctedBlocks };
+  }
 }
 
 async function mergeChanges(ws: ShadowWorkspace, message: string, files: string[]): Promise<void> {
@@ -288,7 +378,7 @@ async function main(): Promise<void> {
 
   log.info(pc.dim("Prompt recibido: ") + pc.white(promptText));
   log.info(pc.dim("Modo de seguridad: ") + pc.magenta(mode.label) + pc.dim(`  (${mode.llmCalls} llamada(s) LLM)`));
-  log.info(pc.dim("Archivos objetivo: ") + pc.cyan(targetRels.join(", ")));
+  log.info(pc.dim("Archivos objetivo: ") + formatTargets(targetRels));
 
   const s = spinner();
   const ws = new ShadowWorkspace();
@@ -301,10 +391,10 @@ async function main(): Promise<void> {
 
     linkNodeModules(worktreePath);
 
-    s.start("Llamando al LLM para proponer SEARCH/REPLACE...");
+    s.start("Llamando al LLM para proponer bloques...");
     let proposal = await proposeChanges(promptText, targetRels);
     llmCalls.proposal += 1;
-    let blocks;
+    let blocks: ParsedBlock[];
     try {
       blocks = LLMParser.parse(proposal.text);
     } catch {
@@ -316,7 +406,7 @@ async function main(): Promise<void> {
       } catch {
         s.stop();
         throw new Error(
-          "El LLM no devolvio bloques SEARCH/REPLACE validos tras 2 intentos. Revisa el modelo o el prompt."
+          "El LLM no devolvio bloques validos tras 2 intentos. Revisa el modelo o el prompt."
         );
       }
     }
@@ -335,7 +425,7 @@ async function main(): Promise<void> {
       } catch {
         s.stop();
         throw new Error(
-          `El LLM no devolvio bloques SEARCH/REPLACE validos al corregir la ruta. Objetivos: ${allowed}.`
+          `El LLM no devolvio bloques validos al corregir la ruta. Objetivos: ${allowed}.`
         );
       }
       missing = unauthorizedBlockPaths(blocks, targetRels);
@@ -348,12 +438,12 @@ async function main(): Promise<void> {
       }
     }
 
-    for (const block of blocks) ensureDemoFile(worktreePath, block.filePath);
-    let applied = blocks.map((block) => LocalEditor.apply(worktreePath, block));
+    let outcome = await applyWithRetry(ws, promptText, targetRels, proposal, blocks);
+    proposal = outcome.proposal;
+    blocks = outcome.blocks;
+    let applied = outcome.applied;
     s.stop();
-    for (const result of applied) {
-      log.success(pc.green(`Parche aplicado en ${result.filePath} (${result.strategy})`));
-    }
+    logApplied(applied);
 
     s.start("Compilando como puerta (tsc --noEmit)...");
     let check = await Validator.run(worktreePath);
@@ -367,8 +457,9 @@ async function main(): Promise<void> {
       }
       await ws.restoreFiles(applied.map((result) => result.filePath));
       const compileFeedback = [
-        "la compilacion (tsc --noEmit) fallo. Regenera UNICAMENTE bloques SEARCH/REPLACE que corrijan estos errores.",
-        "El archivo objetivo esta en su estado original; no asumas que el intento anterior sigue aplicado.",
+        "la compilacion (tsc --noEmit) fallo. Regenera los bloques que corrijan estos errores.",
+        "Usa SEARCH/REPLACE para archivos existentes y NEW FILE para archivos nuevos: los archivos que eran nuevos ya no existen y debes recrearlos con NEW FILE.",
+        "Los archivos estan en su estado original; no asumas que el intento anterior sigue aplicado.",
         "Errores de tsc:",
         check.output || "(sin output)",
       ].join("\n");
@@ -380,7 +471,7 @@ async function main(): Promise<void> {
       } catch {
         s.stop();
         throw new Error(
-          "El LLM no devolvio bloques SEARCH/REPLACE validos al corregir la compilacion."
+          "El LLM no devolvio bloques validos al corregir la compilacion."
         );
       }
       missing = unauthorizedBlockPaths(blocks, targetRels);
@@ -391,12 +482,12 @@ async function main(): Promise<void> {
           `El archivo del bloque no es un objetivo (apuntaba a ${stillWrong}; los objetivos son ${targetRels.join(", ")}) al corregir la compilacion.`
         );
       }
-      for (const block of blocks) ensureDemoFile(worktreePath, block.filePath);
-      applied = blocks.map((block) => LocalEditor.apply(worktreePath, block));
+      outcome = await applyWithRetry(ws, promptText, targetRels, proposal, blocks);
+      proposal = outcome.proposal;
+      blocks = outcome.blocks;
+      applied = outcome.applied;
       s.stop();
-      for (const result of applied) {
-        log.success(pc.green(`Parche aplicado en ${result.filePath} (${result.strategy})`));
-      }
+      logApplied(applied);
       s.start("Compilando como puerta (tsc --noEmit)...");
       check = await Validator.run(worktreePath);
       s.stop();
@@ -413,7 +504,7 @@ async function main(): Promise<void> {
       let auditOk = true;
       if (mode.runAudit) {
         s.start("Auditoria semantica (2da llamada LLM)...");
-        const diff = await ws.diffHead();
+        const diff = await ws.diffHead([...new Set(applied.map((result) => result.filePath))]);
         const audit = await verifyChanges(promptText, diff);
         llmCalls.audit += 1;
         s.stop();
@@ -434,7 +525,7 @@ async function main(): Promise<void> {
       if (!auditOk) {
         log.info(pc.dim("Puerta semantica rechazo el cambio."));
       } else if (mode.runShadow) {
-        const diff = await ws.diffHead();
+        const diff = await ws.diffHead([...new Set(applied.map((result) => result.filePath))]);
         if (diff.trim().length > 0) {
           log.message(diff);
         } else {
@@ -467,6 +558,9 @@ async function main(): Promise<void> {
       }
     }
 
+    const created = applied.filter((result) => result.strategy === "new-file").length;
+    const edited = applied.length - created;
+    log.info(pc.dim("Resultado: ") + pc.white(`${created} archivo(s) creado(s)`) + pc.dim(" · ") + pc.white(`${edited} editado(s)`));
     log.info(pc.dim(llmSummary()));
     outro(pc.cyan("D-Engine") + pc.dim(" finalizado."));
   } finally {
