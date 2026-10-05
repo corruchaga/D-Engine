@@ -20,3 +20,5 @@
 
 9\. Enter vacío en archivo objetivo lanza un selector barato; el usuario confirma o edita; el editor nunca elige solo. El selector puede proponer rutas nuevas bajo src/ y la confirmación las etiqueta como NUEVO.
 
+10\. Todo rechazo de la puerta (formato, ruta, materialización o compilación) se reintenta en un único bucle acotado con presupuesto 1 + maxRetries (default 2, tope 5, configurable con D_ENGINE_MAX_RETRIES). Cada reintento recibe feedback y la fotocopia se restaura a HEAD antes de reaplicar; agotado el presupuesto, nada se consolida.
+

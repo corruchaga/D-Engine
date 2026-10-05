@@ -19,8 +19,18 @@ import {
   proposeCorrection,
   selectTargetFiles,
   verifyChanges,
-  type ProposeResult,
 } from "./llm.js";
+import {
+  attemptLines,
+  formatLlmCalls,
+  llmTotal,
+  resolveMaxRetries,
+  runBoundedRetry,
+  sumTokens,
+  type GateResult,
+  type LlmCalls,
+  type RetryProposal,
+} from "./retry.js";
 import { isSafeNewPath, normalizeRel, resolveSelectorPaths } from "./selector.js";
 
 type SecurityMode = "fast" | "verify" | "shadow";
@@ -63,19 +73,16 @@ const MODES: Record<SecurityMode, ModeConfig> = {
 
 const DEFAULT_TARGET = "src/demo/calculator.ts";
 
-const llmCalls = { selector: 0, proposal: 0, audit: 0 };
+const llmCalls: LlmCalls = { selector: 0, proposal: 0, retries: 0, audit: 0 };
 
-function llmTotal(): number {
-  return llmCalls.selector + llmCalls.proposal + llmCalls.audit;
-}
+const llmTokens = { selector: 0, audit: 0 };
 
-function llmSummary(): string {
-  const parts: string[] = [];
-  if (llmCalls.selector > 0) parts.push(`selector ${llmCalls.selector}`);
-  if (llmCalls.proposal > 0) parts.push(`propuesta ${llmCalls.proposal}`);
-  if (llmCalls.audit > 0) parts.push(`auditoria ${llmCalls.audit}`);
-  const detail = parts.length > 0 ? ` (${parts.join(" + ")})` : "";
-  return `Llamadas LLM: ${llmTotal()}${detail}`;
+function tokenSummary(attemptTokens: number): string {
+  const parts = [`intentos ${attemptTokens}`];
+  if (llmTokens.selector > 0) parts.push(`selector ${llmTokens.selector}`);
+  if (llmTokens.audit > 0) parts.push(`auditoria ${llmTokens.audit}`);
+  const total = attemptTokens + llmTokens.selector + llmTokens.audit;
+  return `${total} (${parts.join(" + ")})`;
 }
 
 function handleCancel<T>(value: T | symbol): T {
@@ -219,6 +226,7 @@ async function resolveTargetFiles(promptText: string): Promise<string[]> {
   try {
     let result = await selectTargetFiles(promptText, catalog.text);
     llmCalls.selector += 1;
+    llmTokens.selector += result.tokensIn + result.tokensOut;
     let resolved = resolveSelectorPaths(result.text, catalog.candidates, { allowNew: true });
     if (!resolved.ok) {
       log.warn(`Selector: ${resolved.reason}. Reintentando una vez...`);
@@ -231,6 +239,7 @@ async function resolveTargetFiles(promptText: string): Promise<string[]> {
         feedback,
       });
       llmCalls.selector += 1;
+      llmTokens.selector += result.tokensIn + result.tokensOut;
       resolved = resolveSelectorPaths(result.text, catalog.candidates, { allowNew: true });
     }
     spin.stop();
@@ -262,54 +271,8 @@ function unauthorizedBlockPaths(blocks: ParsedBlock[], targets: string[]): strin
   return [...new Set(blocks.map((block) => block.filePath).filter((rel) => !allowed.has(rel)))];
 }
 
-interface ApplyOutcome {
+interface GatedChange {
   applied: ApplyResult[];
-  proposal: ProposeResult;
-  blocks: ParsedBlock[];
-}
-
-async function applyWithRetry(
-  ws: ShadowWorkspace,
-  promptText: string,
-  targetRels: string[],
-  initialProposal: ProposeResult,
-  initialBlocks: ParsedBlock[]
-): Promise<ApplyOutcome> {
-  const worktreePath = ws.path;
-  const materialize = (current: ParsedBlock[]): ApplyResult[] => {
-    for (const block of current) ensureDemoFile(worktreePath, block.filePath);
-    LocalEditor.preflight(worktreePath, current);
-    return current.map((block) => LocalEditor.apply(worktreePath, block));
-  };
-
-  try {
-    return { applied: materialize(initialBlocks), proposal: initialProposal, blocks: initialBlocks };
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    log.warn(`No se pudo materializar el parche: ${reason}. Reintentando una vez...`);
-    const feedback = [
-      "no se pudo materializar el parche en la fotocopia.",
-      reason,
-      "Corrige el tipo de bloque: usa NEW FILE solo para archivos que no existen y SEARCH/REPLACE para archivos existentes.",
-      "Responde solo con bloques validos.",
-    ].join("\n");
-    const corrected = await proposeCorrection(promptText, targetRels, initialProposal.text, feedback);
-    llmCalls.proposal += 1;
-    let correctedBlocks: ParsedBlock[];
-    try {
-      correctedBlocks = withNormalizedPaths(LLMParser.parse(corrected.text));
-    } catch {
-      throw new Error("El LLM no devolvio bloques validos al corregir la materializacion del parche.");
-    }
-    const missing = unauthorizedBlockPaths(correctedBlocks, targetRels);
-    if (missing.length > 0) {
-      throw new Error(
-        `El archivo del bloque no es un objetivo (apuntaba a ${missing[0] ?? "(desconocida)"}; los objetivos son ${targetRels.join(", ")}).`
-      );
-    }
-    await ws.restoreFiles(initialBlocks.map((block) => block.filePath));
-    return { applied: materialize(correctedBlocks), proposal: corrected, blocks: correctedBlocks };
-  }
 }
 
 async function mergeChanges(ws: ShadowWorkspace, message: string, files: string[]): Promise<void> {
@@ -371,14 +334,17 @@ async function main(): Promise<void> {
   );
 
   if (!shouldRun) {
-    if (llmTotal() > 0) log.info(pc.dim(llmSummary()));
+    if (llmTotal(llmCalls) > 0) log.info(pc.dim(formatLlmCalls(llmCalls)));
     cancel("Operacion cancelada.");
     process.exit(0);
   }
 
+  const maxRetries = resolveMaxRetries(process.env.D_ENGINE_MAX_RETRIES);
+
   log.info(pc.dim("Prompt recibido: ") + pc.white(promptText));
   log.info(pc.dim("Modo de seguridad: ") + pc.magenta(mode.label) + pc.dim(`  (${mode.llmCalls} llamada(s) LLM)`));
   log.info(pc.dim("Archivos objetivo: ") + formatTargets(targetRels));
+  log.info(pc.dim("Reintentos max: ") + pc.white(String(maxRetries)) + pc.dim(" (D_ENGINE_MAX_RETRIES)"));
 
   const s = spinner();
   const ws = new ShadowWorkspace();
@@ -391,114 +357,80 @@ async function main(): Promise<void> {
 
     linkNodeModules(worktreePath);
 
-    s.start("Llamando al LLM para proponer bloques...");
-    let proposal = await proposeChanges(promptText, targetRels);
-    llmCalls.proposal += 1;
-    let blocks: ParsedBlock[];
-    try {
-      blocks = LLMParser.parse(proposal.text);
-    } catch {
-      log.warn("La respuesta no tenia bloques validos. Reintentando una vez...");
-      proposal = await proposeCorrection(promptText, targetRels, proposal.text);
-      llmCalls.proposal += 1;
-      try {
-        blocks = LLMParser.parse(proposal.text);
-      } catch {
-        s.stop();
-        throw new Error(
-          "El LLM no devolvio bloques validos tras 2 intentos. Revisa el modelo o el prompt."
-        );
-      }
-    }
-    blocks = withNormalizedPaths(blocks);
-    let missing = unauthorizedBlockPaths(blocks, targetRels);
-    if (missing.length > 0) {
-      const wrong = missing[0] ?? "(desconocida)";
-      const allowed = targetRels.join(", ");
-      log.warn(`Ruta de bloque no es un archivo objetivo: ${wrong}. Reintentando una vez...`);
-      const pathCorrection =
-        `los archivos a modificar son exactamente ${allowed}; tu bloque apuntaba a ${wrong}; responde solo con bloques corregidos`;
-      proposal = await proposeCorrection(promptText, targetRels, proposal.text, pathCorrection);
-      llmCalls.proposal += 1;
+    const gate = async (proposal: RetryProposal, _attemptIndex: number): Promise<GateResult<GatedChange>> => {
+      let blocks: ParsedBlock[];
       try {
         blocks = withNormalizedPaths(LLMParser.parse(proposal.text));
-      } catch {
-        s.stop();
-        throw new Error(
-          `El LLM no devolvio bloques validos al corregir la ruta. Objetivos: ${allowed}.`
-        );
+      } catch (error) {
+        return {
+          ok: false,
+          rejection: { kind: "format", reason: error instanceof Error ? error.message : String(error) },
+        };
       }
-      missing = unauthorizedBlockPaths(blocks, targetRels);
+      const missing = unauthorizedBlockPaths(blocks, targetRels);
       if (missing.length > 0) {
-        s.stop();
-        const stillWrong = missing[0] ?? wrong;
-        throw new Error(
-          `El archivo del bloque no es un objetivo (apuntaba a ${stillWrong}; los objetivos son ${allowed}) tras 1 reintento.`
-        );
+        const wrong = missing[0] ?? "(desconocida)";
+        return {
+          ok: false,
+          rejection: {
+            kind: "path",
+            reason: `el archivo del bloque no es un objetivo (apuntaba a ${wrong}; los objetivos son ${targetRels.join(", ")}).`,
+          },
+        };
       }
-    }
 
-    let outcome = await applyWithRetry(ws, promptText, targetRels, proposal, blocks);
-    proposal = outcome.proposal;
-    blocks = outcome.blocks;
-    let applied = outcome.applied;
-    s.stop();
-    logApplied(applied);
-
-    s.start("Compilando como puerta (tsc --noEmit)...");
-    let check = await Validator.run(worktreePath);
-    s.stop();
-
-    if (!check.ok) {
-      console.log("[d-engine] compilacion fallida, reintentando con feedback (1/1)");
-      log.warn("Compilacion fallida. Reintentando con feedback (1/1)...");
-      if (check.output.length > 0) {
-        log.message(check.output);
-      }
-      await ws.restoreFiles(applied.map((result) => result.filePath));
-      const compileFeedback = [
-        "la compilacion (tsc --noEmit) fallo. Regenera los bloques que corrijan estos errores.",
-        "Usa SEARCH/REPLACE para archivos existentes y NEW FILE para archivos nuevos: los archivos que eran nuevos ya no existen y debes recrearlos con NEW FILE.",
-        "Los archivos estan en su estado original; no asumas que el intento anterior sigue aplicado.",
-        "Errores de tsc:",
-        check.output || "(sin output)",
-      ].join("\n");
-      s.start("Llamando al LLM para corregir errores de compilacion...");
-      proposal = await proposeCorrection(promptText, targetRels, proposal.text, compileFeedback);
-      llmCalls.proposal += 1;
+      await ws.restoreFiles(targetRels);
+      let applied: ApplyResult[];
       try {
-        blocks = withNormalizedPaths(LLMParser.parse(proposal.text));
-      } catch {
-        s.stop();
-        throw new Error(
-          "El LLM no devolvio bloques validos al corregir la compilacion."
-        );
+        for (const block of blocks) ensureDemoFile(worktreePath, block.filePath);
+        LocalEditor.preflight(worktreePath, blocks);
+        applied = blocks.map((block) => LocalEditor.apply(worktreePath, block));
+      } catch (error) {
+        return {
+          ok: false,
+          rejection: {
+            kind: "materialization",
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        };
       }
-      missing = unauthorizedBlockPaths(blocks, targetRels);
-      if (missing.length > 0) {
-        s.stop();
-        const stillWrong = missing[0] ?? "(desconocida)";
-        throw new Error(
-          `El archivo del bloque no es un objetivo (apuntaba a ${stillWrong}; los objetivos son ${targetRels.join(", ")}) al corregir la compilacion.`
-        );
+
+      const check = await Validator.run(worktreePath);
+      if (!check.ok) {
+        return { ok: false, rejection: { kind: "compile", reason: check.output, output: check.output } };
       }
-      outcome = await applyWithRetry(ws, promptText, targetRels, proposal, blocks);
-      proposal = outcome.proposal;
-      blocks = outcome.blocks;
-      applied = outcome.applied;
-      s.stop();
-      logApplied(applied);
-      s.start("Compilando como puerta (tsc --noEmit)...");
-      check = await Validator.run(worktreePath);
-      s.stop();
+      return { ok: true, value: { applied } };
+    };
+
+    const propose = async (feedback?: { previousText: string; message: string }) => {
+      if (feedback) {
+        llmCalls.retries += 1;
+        return proposeCorrection(promptText, targetRels, feedback.previousText, feedback.message);
+      }
+      llmCalls.proposal += 1;
+      return proposeChanges(promptText, targetRels);
+    };
+
+    s.start("Proponiendo y verificando con la puerta (tsc)...");
+    const outcome = await runBoundedRetry<GatedChange>({ maxRetries, propose, gate });
+    s.stop();
+
+    for (const line of attemptLines(outcome.attempts)) {
+      log.info(pc.dim(line));
     }
 
-    if (!check.ok) {
-      log.error(pc.red("La puerta de compilacion rechazo el cambio. Nada se consolida."));
-      if (check.output.length > 0) {
-        log.message(check.output);
+    let applied: ApplyResult[] = [];
+    if (!outcome.ok) {
+      log.error(
+        pc.red(`La puerta rechazo el cambio tras ${outcome.attempts.length} intento(s). Nada se consolida.`)
+      );
+      const output = outcome.lastRejection.output ?? outcome.lastRejection.reason;
+      if (output.trim().length > 0) {
+        log.message(output);
       }
     } else {
+      applied = outcome.value.applied;
+      logApplied(applied);
       log.success(pc.green("Compilacion OK: la fotocopia es valida."));
 
       let auditOk = true;
@@ -507,6 +439,7 @@ async function main(): Promise<void> {
         const diff = await ws.diffHead([...new Set(applied.map((result) => result.filePath))]);
         const audit = await verifyChanges(promptText, diff);
         llmCalls.audit += 1;
+        llmTokens.audit += audit.tokensIn + audit.tokensOut;
         s.stop();
         const verdict = parseVerifyVerdict(audit.text);
         if (verdict.ok) {
@@ -561,7 +494,8 @@ async function main(): Promise<void> {
     const created = applied.filter((result) => result.strategy === "new-file").length;
     const edited = applied.length - created;
     log.info(pc.dim("Resultado: ") + pc.white(`${created} archivo(s) creado(s)`) + pc.dim(" · ") + pc.white(`${edited} editado(s)`));
-    log.info(pc.dim(llmSummary()));
+    log.info(pc.dim("Tokens del run: ") + pc.white(tokenSummary(sumTokens(outcome.attempts).total)));
+    log.info(pc.dim(formatLlmCalls(llmCalls)));
     outro(pc.cyan("D-Engine") + pc.dim(" finalizado."));
   } finally {
     if (shadowCreated) {
@@ -581,7 +515,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  if (llmTotal() > 0) log.info(pc.dim(llmSummary()));
+  if (llmTotal(llmCalls) > 0) log.info(pc.dim(formatLlmCalls(llmCalls)));
   cancel(pc.red("Error inesperado: ") + (err instanceof Error ? err.message : String(err)));
   process.exit(1);
 });
